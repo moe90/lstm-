@@ -1,0 +1,66 @@
+#include "lstm.cilk"
+
+#define TRAIN_PATH "/home/parco/k1055347/lstm/timit/train"
+#define TEST_PATH "/home/parco/k1055347/lstm/timit/test"
+#define VALIDATION_PATH "/home/parco/k1055347/lstm/timit/validation"
+
+#define FEATURES_X 39
+#define FEATURES_Y 61
+
+FILE *debugFileLstm;
+FILE *debugFileBlstm;
+
+cilk int main (int argc, char *argv[]) { 
+  data_t trainData, testData, validationData;
+  Cilk_time tm_begin, tm_elapsed;
+  
+  graph_t *myLstm;
+  int layerSizesLstm[3] = {FEATURES_X, 5, FEATURES_Y};
+  
+  graph_t *myBlstm;
+  int layerSizesBlstm[5] = {FEATURES_X, FEATURES_X, 5, 4, FEATURES_Y}; 
+    
+  debugFileLstm = fopen("o/debug_lstm.txt", "w");
+  debugFileBlstm = fopen("o/debug_blstm.txt", "w");
+  
+  readDataFromDirectory(TRAIN_PATH, FEATURES_X, FEATURES_Y, &trainData);
+  readDataFromDirectory(TEST_PATH, FEATURES_X, FEATURES_Y, &testData);
+  readDataFromDirectory(VALIDATION_PATH, FEATURES_X, FEATURES_Y, &validationData);
+
+  myLstm = createLstm(layerSizesLstm, 1);
+  setLayerDirection(myLstm, 0, FORWARD);
+  setLayerDirection(myLstm, 1, FORWARD);
+  setLayerDirection(myLstm, 2, FORWARD);
+  setOutputPer(myLstm, TIMESTEP);
+  setOutputLayerType(myLstm, SOFTMAX);
+  setMaxEpochs(myLstm, 1);
+  setMaxEpochs(myLstm, 1);
+  setShuffleSequences(myLstm, true);
+  setValidateEveryXEpochs(myLstm, 1);
+  setSaveGraphEveryXEpochs(myLstm, 1);
+  setLearningRate(myLstm, 1, 0.001);
+  setLearningRate(myLstm, 2, 0.001);
+  setMomentum(myLstm, 1, 0.9);
+  setMomentum(myLstm, 2, 0.9);
+  setRegularization(myLstm, 1, NONE);
+  setRegularization(myLstm, 2, NONE);
+  setG(myLstm, 1, SIGMOID);
+  setH(myLstm, 1, SIGMOID);
+    
+  tm_begin = Cilk_get_wall_time();  
+  spawn mttrain(myLstm, &trainData, &trainData);
+  //train(myLstm, &trainData, &trainData);
+  sync; 
+  tm_elapsed = Cilk_get_wall_time() - tm_begin;
+  printf("[%d, %f], \n", Cilk_active_size, Cilk_wall_time_to_sec(tm_elapsed));
+  printGraph(myLstm, debugFileLstm);
+  
+  myBlstm = createBlstm(layerSizesBlstm, 1);
+  printGraph(myBlstm, debugFileBlstm);
+  
+  fclose(debugFileLstm);
+  fclose(debugFileBlstm);
+  
+  return 0;
+} 
+

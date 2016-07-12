@@ -1,0 +1,2652 @@
+#include <cilk.h>
+#include <cilk-lib.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <math.h>
+#include <acml.h>
+#include "definitions.h"
+#include "util.c"
+#include "data.c"
+#include "lstm.cilkh"
+#include "lossfunction.c"
+#include "softmax.c"
+#include "activationfunction.c"
+#include "gradientchecking.c"
+
+void initLayerTargets(graph_t *graph, int i) {
+  int j, k;
+  layer_t *layer = &(graph->layers[i]);
+  
+  layer->nrTargetLayers = 0;
+  for(j = 0; j < graph->numLayers; j++) {
+    layer->nrTargetLayers += graph->adjMatrix[i*graph->numLayers+j];
+  }
+  
+  layer->targetArrayOffsets = (int *) calloc(layer->nrTargetLayers, sizeof(int));
+  layer->targetArraySizes = (int *) calloc(layer->nrTargetLayers, sizeof(int));
+  layer->targetLayers = (layer_t **) malloc(layer->nrTargetLayers * sizeof(layer_t *));
+  
+  for(j = 0, k = 0; j < graph->numLayers; j++) {
+    if(graph->adjMatrix[i*graph->numLayers+j] == 1) {
+      layer->targetArrayOffsets[k] = graph->layerInitOffsets[j];
+      
+      switch(graph->layers[j].type) {
+        case INPUT_LAYER:
+          printError("input layer should not be a target of another layer", stderr, false);
+          break;
+        case LSTM_LAYER:
+          layer->targetArraySizes[k] = graph->layers[j].inputSize;
+          layer->targetLayers[k] = &graph->layers[j];
+          if(layer->type == INPUT_LAYER) {
+            graph->layers[j].lstmLayer->isTargetOfInputLayer = true;
+          }
+          break;
+        case OUTPUT_LAYER:
+          layer->targetArraySizes[k] = graph->layers[j].inputSize;
+          layer->targetLayers[k] = &graph->layers[j];
+          break;
+        default:
+          printError("invalid layer type, this should never happen", stderr, false);
+      }
+      graph->layerInitOffsets[j] += layer->layerSize;
+      k++;
+    }    
+  }
+}
+
+void initInputLayer(graph_t *graph, int *layerSizes, int i) {
+  int minibatchSize, layerSize = layerSizes[i];
+  
+  graph->layers[i].type = INPUT_LAYER;
+  if((graph->layers[i].inputLayer = (input_t *) malloc(sizeof(input_t))) == NULL) {
+    printError("out of memory", stderr, true);
+  }
+  graph->layers[i].direction = FORWARD;
+  graph->layers[i].inputSize = layerSizes[i];
+  graph->layers[i].layerSize = layerSizes[i];
+ 
+  minibatchSize = graph->minibatchSize;
+  
+  graph->layers[i].x = allocate3dArray(START_SIZE, minibatchSize, layerSize);
+  graph->layers[i].y = graph->layers[i].x;
+}
+
+void initLstmLayer(graph_t *graph, int *layerSizes, int i) {
+  int inputSize, minibatchSize, layerSize = layerSizes[i];
+  layer_t *layer;
+  lstm_t *lstm;
+  
+  layer = &(graph->layers[i]);
+  
+  if((layer->lstmLayer = (lstm_t *) malloc(sizeof(lstm_t))) == NULL) {
+    printError("out of memory", stderr, true);
+  }
+  
+  layer->type = LSTM_LAYER;
+  layer->direction = FORWARD;
+  layer->inputSize = calcInputSize(graph->numLayers, graph->adjMatrix, layerSizes, i); 
+  layer->layerSize = layerSize;
+  layer->learningRate = 0.001;
+  layer->momentum = 0.9;
+  layer->cur = 0;
+  layer->prev = 1;    
+  layer->regularization = NONE;
+  
+  lstm = layer->lstmLayer;
+  lstm->isTargetOfInputLayer = false;
+  lstm->arraySize = START_SIZE;
+  
+  setG(graph, i, SIGMOID);
+  setH(graph, i, SIGMOID);
+  
+  inputSize = layer->inputSize;
+  minibatchSize = graph->minibatchSize;
+  
+  layer->x    = allocate3dArray(START_SIZE, minibatchSize, inputSize);
+  layer->dx   = allocate3dArray(START_SIZE, minibatchSize, inputSize);
+  
+  layer->y    = allocate3dArray(START_SIZE, minibatchSize, layerSize);
+  layer->dy   = allocate3dArray(START_SIZE, minibatchSize, layerSize);
+  
+  lstm->dyz   = allocate3dArray(START_SIZE, minibatchSize, layerSize);
+  lstm->dyi   = allocate3dArray(START_SIZE, minibatchSize, layerSize);
+  lstm->dyf   = allocate3dArray(START_SIZE, minibatchSize, layerSize);
+  lstm->dyo   = allocate3dArray(START_SIZE, minibatchSize, layerSize);
+  
+  lstm->z    = allocate3dArray(START_SIZE, minibatchSize, layerSize);
+  lstm->i    = allocate3dArray(START_SIZE, minibatchSize, layerSize);
+  lstm->f    = allocate3dArray(START_SIZE, minibatchSize, layerSize);
+  lstm->c    = allocate3dArray(START_SIZE, minibatchSize, layerSize);
+  lstm->o    = allocate3dArray(START_SIZE, minibatchSize, layerSize);
+  lstm->zbar = allocate3dArray(START_SIZE, minibatchSize, layerSize);
+  lstm->ibar = allocate3dArray(START_SIZE, minibatchSize, layerSize);
+  lstm->fbar = allocate3dArray(START_SIZE, minibatchSize, layerSize);
+  lstm->obar = allocate3dArray(START_SIZE, minibatchSize, layerSize);
+  layer->d    = allocate3dArray(START_SIZE, minibatchSize, layerSize);
+  lstm->d_o  = allocate3dArray(START_SIZE, minibatchSize, layerSize);
+  lstm->dc   = allocate3dArray(START_SIZE, minibatchSize, layerSize);
+  lstm->di   = allocate3dArray(START_SIZE, minibatchSize, layerSize);
+  lstm->df   = allocate3dArray(START_SIZE, minibatchSize, layerSize);
+  lstm->dz   = allocate3dArray(START_SIZE, minibatchSize, layerSize);
+  
+  lstm->h_of_c  = allocate3dArray(START_SIZE, minibatchSize, layerSize);
+
+  lstm->Wz = allocate1dArray(layerSize * inputSize);
+  lstm->Wi = allocate1dArray(layerSize * inputSize);
+  lstm->Wf = allocate1dArray(layerSize * inputSize);
+  lstm->Wo = allocate1dArray(layerSize * inputSize);
+  
+  lstm->Rz = allocate1dArray(layerSize * layerSize);
+  lstm->Ri = allocate1dArray(layerSize * layerSize);
+  lstm->Rf = allocate1dArray(layerSize * layerSize);
+  lstm->Ro = allocate1dArray(layerSize * layerSize);
+  
+  lstm->bz = allocate1dArray(layerSize);
+  lstm->bi = allocate1dArray(layerSize);
+  lstm->bf = allocate1dArray(layerSize);
+  lstm->bo = allocate1dArray(layerSize);
+  
+  lstm->dWz = allocate3dArray(2, minibatchSize, layerSize * inputSize);
+  lstm->dWi = allocate3dArray(2, minibatchSize, layerSize * inputSize);
+  lstm->dWf = allocate3dArray(2, minibatchSize, layerSize * inputSize);
+  lstm->dWo = allocate3dArray(2, minibatchSize, layerSize * inputSize);
+  
+  lstm->dRz = allocate3dArray(2, minibatchSize, layerSize * layerSize);
+  lstm->dRi = allocate3dArray(2, minibatchSize, layerSize * layerSize);
+  lstm->dRf = allocate3dArray(2, minibatchSize, layerSize * layerSize);
+  lstm->dRo = allocate3dArray(2, minibatchSize, layerSize * layerSize);
+  
+  lstm->dbz = allocate3dArray(2, minibatchSize, layerSize);
+  lstm->dbi = allocate3dArray(2, minibatchSize, layerSize);
+  lstm->dbf = allocate3dArray(2, minibatchSize, layerSize);
+  lstm->dbo = allocate3dArray(2, minibatchSize, layerSize);
+  
+  lstm->ztemp1 = allocate3dArray(START_SIZE, minibatchSize, layerSize);
+  lstm->ztemp2 = allocate3dArray(START_SIZE, minibatchSize, layerSize);
+  lstm->itemp1 = allocate3dArray(START_SIZE, minibatchSize, layerSize);
+  lstm->itemp2 = allocate3dArray(START_SIZE, minibatchSize, layerSize);
+  lstm->ftemp1 = allocate3dArray(START_SIZE, minibatchSize, layerSize);
+  lstm->ftemp2 = allocate3dArray(START_SIZE, minibatchSize, layerSize);
+  lstm->otemp1 = allocate3dArray(START_SIZE, minibatchSize, layerSize);
+  lstm->otemp2 = allocate3dArray(START_SIZE, minibatchSize, layerSize);
+  
+  lstm->dztemp = allocate3dArray(START_SIZE, minibatchSize, inputSize);
+  lstm->ditemp = allocate3dArray(START_SIZE, minibatchSize, inputSize);
+  lstm->dftemp = allocate3dArray(START_SIZE, minibatchSize, inputSize);
+  lstm->dotemp = allocate3dArray(START_SIZE, minibatchSize, inputSize);
+  
+  /*
+  #ifdef GRADIENTCHECKING
+  lstm->dWz_gc = allocate3dArray(START_SIZE, minibatchSize, layerSize * inputSize);
+  lstm->dWi_gc = allocate3dArray(START_SIZE, minibatchSize, layerSize * inputSize);
+  lstm->dWf_gc = allocate3dArray(START_SIZE, minibatchSize, layerSize * inputSize);
+  lstm->dWo_gc = allocate3dArray(START_SIZE, minibatchSize, layerSize * inputSize);
+  
+  lstm->dRz_gc = allocate3dArray(START_SIZE, minibatchSize, layerSize * layerSize);
+  lstm->dRi_gc = allocate3dArray(START_SIZE, minibatchSize, layerSize * layerSize);
+  lstm->dRf_gc = allocate3dArray(START_SIZE, minibatchSize, layerSize * layerSize);
+  lstm->dRo_gc = allocate3dArray(START_SIZE, minibatchSize, layerSize * layerSize);
+  
+  lstm->dbz_gc = allocate3dArray(START_SIZE, minibatchSize, layerSize);
+  lstm->dbi_gc = allocate3dArray(START_SIZE, minibatchSize, layerSize);
+  lstm->dbf_gc = allocate3dArray(START_SIZE, minibatchSize, layerSize);
+  lstm->dbo_gc = allocate3dArray(START_SIZE, minibatchSize, layerSize);
+  #endif /* GRADIENTCHECKING */
+  
+  initializeMatrix(lstm->Wz, layerSize, inputSize);
+  initializeMatrix(lstm->Wi, layerSize, inputSize);
+  initializeMatrix(lstm->Wf, layerSize, inputSize);
+  initializeMatrix(lstm->Wo, layerSize, inputSize);
+  
+  initializeMatrix(lstm->Rz, layerSize, layerSize);
+  initializeMatrix(lstm->Ri, layerSize, layerSize);
+  initializeMatrix(lstm->Rf, layerSize, layerSize);
+  initializeMatrix(lstm->Ro, layerSize, layerSize);
+  
+  initializeVector(lstm->bz, layerSize);
+  initializeVector(lstm->bi, layerSize);
+  initializeVector(lstm->bf, layerSize);
+  initializeVector(lstm->bo, layerSize);  
+}
+
+void initOutputLayer(graph_t *graph, int *layerSizes, int i) {
+  int inputSize, minibatchSize, layerSize = layerSizes[i];
+  layer_t *layer;
+  output_t *output;
+  
+  layer = &(graph->layers[i]);
+  
+  if((layer->outputLayer = (output_t *) malloc(sizeof(output_t))) == NULL) {
+    printError("out of memory", stderr, true);
+  }
+  
+  layer->type = OUTPUT_LAYER;  
+  layer->direction = FORWARD;    
+  layer->inputSize = calcInputSize(graph->numLayers, graph->adjMatrix, layerSizes, i);  
+  layer->layerSize = layerSizes[i];  
+  layer->learningRate = 0.001;
+  layer->momentum = 0.9;
+  layer->cur = 0;
+  layer->prev = 1;
+  layer->regularization = NONE;
+  
+  output = layer->outputLayer;  
+  setOutputLayerType(graph, MSE);
+  
+  inputSize = layer->inputSize;
+  minibatchSize = graph->minibatchSize;
+  
+  layer->x = allocate3dArray(START_SIZE, minibatchSize, inputSize);
+  layer->dx = allocate3dArray(START_SIZE, minibatchSize, inputSize);
+  
+  output->z = allocate3dArray(START_SIZE, minibatchSize, layerSize);
+  
+  layer->y = allocate3dArray(START_SIZE, minibatchSize, layerSize);
+  layer->d = allocate3dArray(START_SIZE, minibatchSize, layerSize);
+  
+  output->W = allocate1dArray(layerSize * inputSize);
+  output->b = allocate1dArray(layerSize);
+  
+  output->dW = allocate4dArray(2, START_SIZE, minibatchSize, layerSize * inputSize);
+  output->db = allocate4dArray(2, START_SIZE, minibatchSize, layerSize);
+    
+  output->target = allocate3dArray(START_SIZE, minibatchSize, layerSize);
+  
+  initializeMatrix(output->W, layerSize, inputSize);  
+  initializeVector(output->b, layerSize);
+}
+
+int calcInputSize(int numLayers, int *adjMatrix, int *layerSizes, int idx) {
+  int j, size = 0;
+  for(j = 0; j < numLayers; j++) {
+    if(adjMatrix[j*numLayers+idx] == 1) {
+      size += layerSizes[j];
+    }
+  }
+  return size;
+}
+
+graph_t *createGraph(int *adjMatrix, int numLayers, int *layerSizes, int minibatchSize, int bidirectional) {
+  graph_t *graph = NULL;
+  int i;
+  int numInputLayers = (bidirectional == true ? 2 : 1);
+  int numLstmLayers = numLayers - numInputLayers - 1; //minus 1 to account for output layer
+    
+  if(numLstmLayers <= 0) {
+    printf("numLayers: %d\nbid: %d\nnumLstmLayers: %d\n", numLayers, (bidirectional == true ? 2 : 1), numLstmLayers);
+    printError("adjancency matrix is too small", stderr, true);
+  } else {
+    
+    if((graph = (graph_t *) malloc(sizeof(graph_t))) == NULL) {
+      printError("out of memory", stderr, true);
+    }
+    
+    graph->bidirectional = bidirectional;
+    graph->adjMatrix = adjMatrix;
+    graph->numLayers = numLayers;
+    graph->numInputLayers = numInputLayers;
+    graph->outputLayerOffset = graph->numLayers - 1;
+    graph->numLstmLayers = numLayers - (graph->numInputLayers + 1);
+    graph->minibatchSize = minibatchSize;
+    graph->maxEpochs = 1;
+    graph->maxEpochsWithoutImprovement = 1;
+    graph->shuffleSequences = true;
+    graph->validateEveryXEpochs = 1;
+    graph->saveGraphEveryXEpochs = 1;
+    graph->outputPer = SEQUENCE;
+    
+    if((graph->layerInitOffsets = (int *) calloc(numLayers, sizeof(int))) == NULL) {
+      printError("out of memory", stderr, true);
+    }
+    
+    if((graph->layers = (layer_t *) calloc(numLayers, sizeof(layer_t))) == NULL) {
+      printError("out of memory", stderr, true);
+    }
+    
+    //input layer[s]
+    initInputLayer(graph, layerSizes, 0);
+    if(bidirectional == true) {
+      initInputLayer(graph, layerSizes, 1);
+    }
+    
+    //hidden layer[s]
+    for(i = numInputLayers; i < numLayers-1; i++) {
+      initLstmLayer(graph, layerSizes, i);
+    }
+    
+    //output layer
+    initOutputLayer(graph, layerSizes, numLayers-1);
+    
+    for(i = 0; i < numLayers; i++) {
+      initLayerTargets(graph, i);
+    }
+    
+    if((graph->currentSequence = (sequence_t **) malloc(minibatchSize * sizeof(sequence_t *))) == NULL) {
+      printError("out of memory", stderr, true);
+    }
+    
+    for(i = 0; i < minibatchSize; i++) {
+      graph->currentSequence[i] = NULL;
+    }
+  }
+  return graph;
+}
+
+graph_t *createLstm(int *layerSizes, int minibatchSize) {
+  int adjMatrix[9] = {0, 1, 0, 
+                      0, 0, 1, 
+                      0, 0, 0};
+  
+  return createGraph(adjMatrix, 3, layerSizes, minibatchSize, false);
+}
+
+graph_t *createBlstm(int *layerSizes, int minibatchSize) {
+  int adjMatrix[25] = {0, 0, 1, 0, 0, 
+                       0, 0, 0, 1, 0,
+                       0, 0, 0, 0, 1,
+                       0, 0, 0, 0, 1,
+                       0, 0, 0, 0, 0};
+  
+  return createGraph(adjMatrix, 5, layerSizes, minibatchSize, true);
+}
+
+FLOAT *allocate1dArray(int a) {
+  FLOAT *array;
+  
+  if((array = (FLOAT *) calloc(a, sizeof(FLOAT))) == NULL) {
+    printError("out of memory", stderr, true);
+  }  
+    
+  return array;
+}
+
+FLOAT **allocate2dArray(int a, int b) {
+  int i;
+  FLOAT **array;
+  
+  if((array = (FLOAT **) malloc(a * sizeof(FLOAT *))) == NULL) {
+    printError("out of memory", stderr, true);
+  }  
+  for(i = 0; i < a; i++) {
+    if((array[i] = (FLOAT *) calloc(b, sizeof(FLOAT))) == NULL) {
+      printError("out of memory", stderr, true);
+    }
+  }
+  
+  return array;
+}
+
+FLOAT ***allocate3dArray(int a, int b, int c) {
+  int i, j;
+  FLOAT ***array;
+  
+  if((array = (FLOAT ***) malloc(a * sizeof(FLOAT **))) == NULL) {
+    printError("out of memory", stderr, true);
+  }  
+  for(i = 0; i < a; i++) {
+    if((array[i] = (FLOAT **) malloc(b * sizeof(FLOAT *))) == NULL) {
+      printError("out of memory", stderr, true);
+    }
+    for(j = 0; j < b; j++) {
+      if((array[i][j] = (FLOAT *) calloc(c, sizeof(FLOAT))) == NULL) {
+        printError("out of memory", stderr, true);
+      }
+    }
+  }
+  
+  return array;
+}
+
+FLOAT ****allocate4dArray(int a, int b, int c, int d) {
+  int i, j, k;
+  FLOAT ****array;
+  
+  if((array = (FLOAT ****) malloc(a * sizeof(FLOAT ***))) == NULL) {
+    printError("out of memory", stderr, true);
+  }  
+  for(i = 0; i < a; i++) {
+    if((array[i] = (FLOAT ***) malloc(b * sizeof(FLOAT **))) == NULL) {
+      printError("out of memory", stderr, true);
+    }
+    for(j = 0; j < b; j++) {
+      if((array[i][j] = (FLOAT **) malloc(c * sizeof(FLOAT *))) == NULL) {
+        printError("out of memory", stderr, true);
+      }
+      for(k = 0; k < c; k++) {
+        if((array[i][j][k] = (FLOAT *) calloc(d, sizeof(FLOAT))) == NULL) {
+        printError("out of memory", stderr, true);
+      }
+      }
+    }
+  }
+  
+  return array;
+}
+
+char *typeNumToTypeName(int typeNum) {
+  switch(typeNum) {
+    case INPUT_LAYER:
+      return "INPUT_LAYER";
+    case LSTM_LAYER:
+      return "LSTM_LAYER";
+    case OUTPUT_LAYER:
+      return "OUTPUT_LAYER";
+    default:
+      return "WRONG LAYER TYPE";
+  }
+}
+
+void printGraph(graph_t *graph, FILE *out) {
+  int i, t, cur;
+  layer_t *layer;
+  lstm_t *lstm;
+  output_t *output;
+  sequence_t *curSeq;
+  
+  fprintf(out, "-------------------------------------------------------------------------\n");
+  fprintf(out, "bidirectional: %s\n", graph->bidirectional == true ? "TRUE" : "FALSE");
+  fprintf(out, "minibatchSize: %d\n", graph->minibatchSize);
+  fprintf(out, "maxEpochs: %d\n", graph->maxEpochs);
+  fprintf(out, "maxEpochsWithoutImprovement: %d\n", graph->maxEpochsWithoutImprovement);
+  fprintf(out, "shuffleSequences: %s\n", graph->shuffleSequences == true ? "TRUE" : "FALSE");
+  fprintf(out, "validateEveryXEpochs: %d\n", graph->validateEveryXEpochs);
+  fprintf(out, "savegrapheveryXEpochs: %d\n", graph->saveGraphEveryXEpochs);
+  fprintf(out, "outputPer: %d\n", graph->outputPer);
+  
+  printMatrixI(graph->adjMatrix, graph->numLayers, graph->numLayers, "adjMatrix", out);
+  
+  for(i = 0; i < graph->numLayers; i++) {
+    layer = &(graph->layers[i]);
+    fprintf(out, ANSI_COLOR_GREEN"layer %d: %s %s %p %p %p %d %d\n"ANSI_COLOR_RESET, 
+      i, 
+      typeNumToTypeName(graph->layers[i].type),
+      layer->direction == FORWARD ? "FORWARD" : "BACKWARD",
+      layer->inputLayer,
+      layer->lstmLayer,
+      layer->outputLayer,
+      layer->inputSize,
+      layer->layerSize);
+    fprintf(out, "layerSize: %d\n", layer->layerSize);
+    if(layer->type == LSTM_LAYER) {
+      fprintf(out, "isTargetOfInputLayer: %s\n", layer->lstmLayer->isTargetOfInputLayer == true ? "TRUE" : "FALSE");
+    }
+    
+    for(t = 0; t < 3; t++) {
+      fprintf(out, "t = %d\n", t);
+      curSeq = graph->currentSequence[0];
+      switch(layer->type) {
+        case INPUT_LAYER:
+          print1dArray(layer->x[t][0], layer->inputSize, "x", out);
+          print1dArray(layer->y[t][0], layer->inputSize, "y", out);
+        break;        
+        case LSTM_LAYER:
+          lstm = layer->lstmLayer;
+          cur = layer->cur;
+          print1dArray(layer->x[t][0], layer->inputSize, "x", out);
+          print1dArray(layer->dx[t][0], layer->inputSize, "dx", out);
+          if(curSeq != NULL) print2dArray2(layer->x, graph->currentSequence[0]->length, layer->inputSize, "xall", out, 0);
+          
+          print1dArray(layer->y[t][0], layer->layerSize, "y", out);
+          if(t != 0) print1dArray(layer->y[t-1][0], layer->layerSize, "y_t_minus_1", out);
+          print1dArray(layer->dy[t][0], layer->layerSize, "dy", out);
+          if(curSeq != NULL) print2dArray2(layer->y, graph->currentSequence[0]->length, layer->layerSize, "yall", out, 0);
+          print1dArray(lstm->dyz[t][0], layer->layerSize, "dyz", out);
+          print1dArray(lstm->dyi[t][0], layer->layerSize, "dyi", out);
+          print1dArray(lstm->dyf[t][0], layer->layerSize, "dyf", out);
+          print1dArray(lstm->dyo[t][0], layer->layerSize, "dyo", out);
+          
+          print1dArray(lstm->z[t][0], layer->layerSize, "z", out);
+          print1dArray(lstm->dz[t][0], layer->layerSize, "dz", out);
+          if(curSeq != NULL) print2dArray2(lstm->dz, graph->currentSequence[0]->length, layer->layerSize, "dzall", out, 0);
+          print1dArray(lstm->dz[t+1][0], layer->layerSize, "dz_t_plus_1", out);
+          print1dArray(lstm->zbar[t][0], layer->layerSize, "zbar", out);
+          print2dArray(lstm->Wz, layer->layerSize, layer->inputSize, "Wz", out);
+          print2dArray(lstm->Rz, layer->layerSize, layer->layerSize, "Rz", out);
+          print1dArray(lstm->bz, layer->layerSize, "bz", out);
+          print2dArray(lstm->dWz[cur][0], layer->layerSize, layer->inputSize, "dWz", out);
+          print2dArray(lstm->dRz[cur][0], layer->layerSize, layer->layerSize, "dRz", out);
+          print1dArray(lstm->dbz[cur][0], layer->layerSize, "dbz", out);
+          
+          print1dArray(lstm->i[t][0], layer->layerSize, "i", out);
+          print1dArray(lstm->di[t][0], layer->layerSize, "di", out);
+          if(curSeq != NULL) print2dArray2(lstm->di, graph->currentSequence[0]->length, layer->layerSize, "diall", out, 0);
+          print1dArray(lstm->di[t+1][0], layer->layerSize, "di_t_plus_1", out);
+          print1dArray(lstm->ibar[t][0], layer->layerSize, "ibar", out);
+          print2dArray(lstm->Wi, layer->layerSize, layer->inputSize, "Wi", out);
+          print2dArray(lstm->Ri, layer->layerSize, layer->layerSize, "Ri", out);
+          print1dArray(lstm->bi, layer->layerSize, "bi", out);
+          print2dArray(lstm->dWi[cur][0], layer->layerSize, layer->inputSize, "dWi", out);
+          print2dArray(lstm->dRi[cur][0], layer->layerSize, layer->layerSize, "dRi", out);
+          print1dArray(lstm->dbi[cur][0], layer->layerSize, "dbi", out);
+          
+          print1dArray(lstm->f[t][0], layer->layerSize, "f", out);
+          print1dArray(lstm->f[t+1][0], layer->layerSize, "f_t_plus_1", out);
+          print1dArray(lstm->df[t][0], layer->layerSize, "df", out);
+          print1dArray(lstm->df[t+1][0], layer->layerSize, "df_t_plus_1", out);
+          if(curSeq != NULL) print2dArray2(lstm->df, graph->currentSequence[0]->length, layer->layerSize, "dfall", out, 0);
+          print1dArray(lstm->fbar[t][0], layer->layerSize, "fbar", out);
+          print2dArray(lstm->Wf, layer->layerSize, layer->inputSize, "Wf", out);
+          print2dArray(lstm->Rf, layer->layerSize, layer->layerSize, "Rf", out);
+          print1dArray(lstm->bf, layer->layerSize, "bf", out);
+          print2dArray(lstm->dWf[cur][0], layer->layerSize, layer->inputSize, "dWf", out);
+          print2dArray(lstm->dRf[cur][0], layer->layerSize, layer->layerSize, "dRf", out);
+          print1dArray(lstm->dbf[cur][0], layer->layerSize, "dbf", out);
+          
+          print1dArray(lstm->o[t][0], layer->layerSize, "o", out);
+          print1dArray(lstm->d_o[t][0], layer->layerSize, "do", out);
+          print1dArray(lstm->d_o[t+1][0], layer->layerSize, "do_t_plus_1", out);
+          if(curSeq != NULL) print2dArray2(lstm->d_o, graph->currentSequence[0]->length, layer->layerSize, "doall", out, 0);
+          print1dArray(lstm->obar[t][0], layer->layerSize, "obar", out);
+          print2dArray(lstm->Wo, layer->layerSize, layer->inputSize, "Wo", out);
+          print2dArray(lstm->Ro, layer->layerSize, layer->layerSize, "Ro", out);
+          print1dArray(lstm->bo, layer->layerSize, "bo", out);
+          print2dArray(lstm->dWo[cur][0], layer->layerSize, layer->inputSize, "dWo", out);
+          print2dArray(lstm->dRo[cur][0], layer->layerSize, layer->layerSize, "dRo", out);
+          print1dArray(lstm->dbo[cur][0], layer->layerSize, "dbo", out);
+                 
+          print1dArray(lstm->c[t][0], layer->layerSize, "c", out);   
+          if(t != 0) print1dArray(lstm->c[t-1][0], layer->layerSize, "c_t_minus_1", out);
+          print1dArray(lstm->dc[t+1][0], layer->layerSize, "dc_t_plus_1", out);
+          print1dArray(lstm->dc[t][0], layer->layerSize, "dc", out);  
+          print1dArray(lstm->h_of_c[t][0], layer->layerSize, "h_of_c", out);
+          
+          print1dArray(layer->d[t][0], layer->layerSize, "d", out);
+          if(curSeq != NULL) print2dArray2(layer->d, graph->currentSequence[0]->length, layer->layerSize, "dall", out, 0);
+          
+        break;
+        case OUTPUT_LAYER:
+          output = layer->outputLayer;
+          cur = layer->cur;
+          fprintf(out, "outputLayerType: %s\n", output->type == MSE ? "MSE" : "SOFTMAX");
+          print1dArray(layer->x[t][0], layer->inputSize, "x", out);
+          if(curSeq != NULL) print2dArray2(layer->x, graph->currentSequence[0]->length, layer->inputSize, "xall", out, 0);
+          print1dArray(layer->y[t][0], layer->layerSize, "y", out);
+          print1dArray(output->z[t][0], layer->layerSize, "z", out);
+          print1dArray(output->target[t][0], layer->layerSize, "target", out);
+          print1dArray(output->b, layer->layerSize, "b", out);
+          print2dArray(output->W, layer->layerSize, layer->inputSize, "W", out);
+          print1dArray(layer->d[t][0], layer->layerSize, "d", out);
+          print1dArray(layer->dx[t][0], layer->inputSize, "dx", out);
+          print1dArray(output->db[cur][t][0], layer->layerSize, "db", out);
+          print2dArray(output->dW[cur][t][0], layer->layerSize, layer->inputSize, "dW", out);
+        break;
+      }
+      fprintf(out, "\n");
+    }    
+    fprintf(out, "\n");
+  }
+  fprintf(out, "-------------------------------------------------------------------------\n");
+}
+
+void initializeMatrix(FLOAT *a, int m, int n) {
+  int i, j;
+  
+  for(i = 0; i < m; i++) {
+    for(j = 0; j < n; j++) {
+      a[i*n+j] = randGauss(0, 0.1);
+    }
+  }
+}
+
+void initializeVector(FLOAT *v, int n) {
+  int i;
+  
+  for(i = 0; i < n; i++) {
+    v[i] = randGauss(0, 0.1);
+  }  
+}
+
+void train(graph_t *graph, data_t *trainData, data_t *testData) {
+  error_t testError;
+  int i, j, numSequences, epoch, maxEpochs, minibatchSize, shuffleSequences;
+  int *dataAccessIndices;
+  sequence_t *sequence = NULL;
+  
+  epoch = 0;
+  maxEpochs = graph->maxEpochs;
+  numSequences = trainData->numSequences;
+  minibatchSize = graph->minibatchSize;
+  shuffleSequences = graph->shuffleSequences;
+  
+  if((dataAccessIndices = (int *) malloc(trainData->numSequences * sizeof(int))) == NULL) {
+    printError("out of memory", stdout, true);
+  }  
+  for(i = 0; i < numSequences; i++) {
+    dataAccessIndices[i] = i;    
+  }
+  
+  do {
+    //printf("epoch %d\n", epoch); 
+    for(i = 0; i < trainData->numSequences; i += minibatchSize) { //sequential
+      for(j = 0; j < minibatchSize && j < numSequences - i; j++) { //parallel
+        sequence = &(trainData->sequences[dataAccessIndices[j+i]]);
+        trainSequence(graph, sequence, j);
+      }
+      //TODO
+      //updateWeights(graph);
+    }
+    
+    if(shuffleSequences == true) {
+      shuffleVector(dataAccessIndices, numSequences);
+    }
+    
+    testError = calculateError(graph, testData);
+    //printf("[%d, %5.3lf], \n", epoch, testError.error);
+    
+    epoch++;
+  } while(epoch < maxEpochs); //until abort condition is met
+}
+
+cilk void mttrain(graph_t *graph, data_t *trainData, data_t *testData) {
+  error_t testError;
+  int i, j, numSequences, epoch, maxEpochs, minibatchSize, shuffleSequences;
+  int *dataAccessIndices;
+  sequence_t *sequence = NULL;
+  
+  epoch = 0;
+  maxEpochs = graph->maxEpochs;
+  numSequences = trainData->numSequences;
+  minibatchSize = graph->minibatchSize;
+  shuffleSequences = graph->shuffleSequences;
+  
+  if((dataAccessIndices = (int *) malloc(trainData->numSequences * sizeof(int))) == NULL) {
+    printError("out of memory", stdout, true);
+  }  
+  
+  for(i = 0; i < numSequences; i++) {
+    dataAccessIndices[i] = i;    
+  }
+  
+  do {
+    for(i = 0; i < 1 trainData->numSequences; i += minibatchSize) { //sequential
+      for(j = 0; j < minibatchSize && j < numSequences - i; j++) { //parallel
+        sequence = &(trainData->sequences[dataAccessIndices[j+i]]);
+        spawn mttrainSequence(graph, sequence, j);
+      }
+      sync;
+      spawn mtupdateWeights(graph);
+      sync;
+    }
+    
+    if(shuffleSequences == true) {
+      spawn mtshuffleVector(dataAccessIndices, numSequences);
+      sync;
+    }
+    testError = spawn mtcalculateError(graph, testData, 0, testData->numSequences);
+    sync;
+    //printf("[%d, %5.3lf], \n", epoch, testError.error);
+    
+    epoch++;
+  } while(epoch < maxEpochs); //until abort condition is met
+}
+
+void trainSequence(graph_t *graph, sequence_t *sequence, int j) {
+  #ifdef GRADIENTCHECKING
+  FLOAT difference, maxDifference = 0;
+  #endif /* GRADIENTCHECKING */
+  
+  //printf("s: %d of %d, e: %d of %d\n", i+j, numSequences, epoch, graph->maxEpochs);
+  forwardPass(graph, sequence, j);
+  backwardPass(graph, j);
+  lstmCalculateWeightDeltas(graph, j);
+          
+  #ifdef GRADIENTCHECKING
+  difference = checkGradient(graph, j);
+  maxDifference = difference > maxDifference ? difference : maxDifference;
+  printf("maxDifference = %e\n", maxDifference);
+  #endif /* GRADIENTCHECKING */
+}
+
+//TODO check 0
+cilk void mttrainSequence(graph_t *graph, sequence_t *sequence, int j) {
+  #ifdef GRADIENTCHECKING
+  FLOAT difference, maxDifference = 0;
+  #endif /* GRADIENTCHECKING */
+  
+  //printf("s: %d of %d, e: %d of %d\n", i+j, numSequences, epoch, graph->maxEpochs);
+  spawn mtforwardPass(graph, sequence, j);
+  sync;
+  spawn mtbackwardPass(graph, j);
+  sync;
+  spawn mtlstmCalculateWeightDeltas(graph, j);
+  sync; 
+  
+  #ifdef GRADIENTCHECKING
+  difference = checkGradient(graph, j);
+  maxDifference = difference > maxDifference ? difference : maxDifference;
+  printf("maxDifference = %e\n", maxDifference);
+  #endif /* GRADIENTCHECKING */
+}
+
+void forwardPass(graph_t *graph, sequence_t *sequence, int j) {
+  int length, t;
+  
+  length = sequence->length;
+  graph->currentSequence[j] = sequence;
+  
+  if(graph->bidirectional == true) {    
+    setInputSequence(&(graph->layers[0]), sequence->x, length, j, FORWARD);
+    setInputSequence(&(graph->layers[1]), sequence->x, length, j, BACKWARD);
+    setOutputSequence(&(graph->layers[graph->numLayers-1]), sequence->y, length, j, FORWARD);
+  } else {
+    setInputSequence(&(graph->layers[0]), sequence->x, length, j, FORWARD);
+    setOutputSequence(&(graph->layers[graph->numLayers-1]), sequence->y, length, j, FORWARD);
+  }
+  
+  for(t = 0; t < length; t++) { //sequential
+    //printf("fp %d\n", t);
+    forwardPassInputLayers(graph, t, j);
+    forwardPassLstmLayers(graph, t, j);
+  }
+  
+  if(graph->outputPer == TIMESTEP) {
+    for(t = 0; t < length; t++) { //in any order 
+      forwardPassOutputLayer(graph, t, j);
+    } 
+  } else { //SEQUENCE      
+    forwardPassOutputLayer(graph, length-1, j);
+  }
+}
+
+void forwardPassInputLayers(graph_t *graph, int t, int j) {
+  //forward input
+  forwardOutputToNextLayers(graph, &(graph->layers[0]), t, j);  
+  
+  if(graph->bidirectional == true) {
+    //backward input
+    forwardOutputToNextLayers(graph, &(graph->layers[1]), t, j);      
+  }
+}
+
+void forwardPassLstmLayers(graph_t *graph, int t, int j) {
+  int i, offset;
+  
+  offset = graph->numInputLayers;  
+  for(i = 0; i < graph->numLstmLayers; i++) {
+    forwardPassLstmLayer(graph, &(graph->layers[offset + i]), t, j);
+  }
+}
+
+void forwardPassLstmLayer(graph_t *graph, layer_t *layer, int t, int j) {
+  lstmCalculateY(layer, t, j);    
+  forwardOutputToNextLayers(graph, layer, t, j);
+}
+
+void forwardPassOutputLayer(graph_t *graph, int t, int j) {  
+  outputCalculateY(&(graph->layers[graph->outputLayerOffset]), t, j);
+}
+
+void forwardOutputToNextLayers(graph_t *graph, layer_t *layer, int t, int j) {
+  int i; 
+      
+  for(i = 0; i < layer->nrTargetLayers; i++) {
+    forwardOutputToNextLayer(graph, layer, layer->targetLayers[i], layer->targetArrayOffsets[i], t, j);
+  }
+}
+
+void forwardOutputToNextLayer(graph_t *graph, layer_t *layer, layer_t *targetLayer, int offset, int t, int j) {
+  int k; 
+  
+  if((graph->outputPer == TIMESTEP) || 
+     (targetLayer->type == LSTM_LAYER) ||
+     (graph->outputPer == SEQUENCE && graph->currentSequence[j]->length == t+1)) {
+        
+    for(k = 0; k < layer->layerSize; k++) {
+      targetLayer->x[t][j][k+offset] = layer->y[t][j][k];
+    }    
+  } else {
+    memset(targetLayer->x[t][j], 0, sizeof(FLOAT) * targetLayer->inputSize);
+  }
+}
+
+cilk void mtforwardPass(graph_t *graph, sequence_t *sequence, int j) {
+  int length, t;
+  
+  length = sequence->length;
+  graph->currentSequence[j] = sequence;
+  
+  if(graph->bidirectional == true) {
+    spawn mtsetInputSequence(&(graph->layers[0]), sequence->x, length, 0, length, j, FORWARD);
+    spawn mtsetInputSequence(&(graph->layers[1]), sequence->x, length, 0, length, j, BACKWARD);
+    spawn mtsetOutputSequence(&(graph->layers[graph->numLayers-1]), sequence->y, length, 0, length, j, FORWARD);
+    sync;
+  } else {
+    spawn mtsetInputSequence(&(graph->layers[0]), sequence->x, length, 0, length, j, FORWARD);
+    spawn mtsetOutputSequence(&(graph->layers[graph->numLayers-1]), sequence->y, length, 0, length, j, FORWARD);
+    sync;
+  }
+  
+  for(t = 0; t < length; t++) { //sequential
+    //printf("fp %d\n", t);
+    spawn mtforwardPassInputLayers(graph, t, j);
+    sync;
+    spawn mtforwardPassLstmLayers(graph, t, j);
+    sync;
+  }
+  
+  if(graph->outputPer == TIMESTEP) {
+    for(t = 0; t < length; t++) { //in any order 
+      spawn mtforwardPassOutputLayer(graph, t, j);
+      sync;
+    } 
+  } else { //SEQUENCE      
+    spawn mtforwardPassOutputLayer(graph, length-1, j);
+    sync;
+  }
+}
+
+cilk void mtforwardPassInputLayers(graph_t *graph, int t, int j) {
+  //forward input
+  spawn mtforwardOutputToNextLayers(graph, &(graph->layers[0]), t, j);  
+  
+  if(graph->bidirectional == true) {
+    //backward input
+    spawn mtforwardOutputToNextLayers(graph, &(graph->layers[1]), t, j);      
+  }
+}
+
+cilk void mtforwardPassLstmLayers(graph_t *graph, int t, int j) {
+  int i, offset;
+  
+  offset = graph->numInputLayers;  
+  //TODO probably parallel stuff, fix this all lstm layers are parallel now
+  for(i = 0; i < graph->numLstmLayers; i++) { 
+    spawn mtforwardPassLstmLayer(graph, &(graph->layers[offset + i]), t, j);
+  }
+}
+
+cilk void mtforwardPassLstmLayer(graph_t *graph, layer_t *layer, int t, int j) {
+  spawn mtlstmCalculateY(layer, t, j);    
+  sync;
+  spawn mtforwardOutputToNextLayers(graph, layer, t, j);
+}
+
+cilk void mtforwardPassOutputLayer(graph_t *graph, int t, int j) {  
+  spawn mtoutputCalculateY(&(graph->layers[graph->outputLayerOffset]), t, j);
+}
+
+cilk void mtforwardOutputToNextLayers(graph_t *graph, layer_t *layer, int t, int j) {
+  int i; 
+      
+  for(i = 0; i < layer->nrTargetLayers; i++) {
+    spawn mtforwardOutputToNextLayer(graph, layer, layer->targetLayers[i], layer->targetArrayOffsets[i], t, j);
+  }
+}
+
+cilk void mtforwardOutputToNextLayer(graph_t *graph, layer_t *layer, layer_t *targetLayer, int offset, int t, int j) {
+  int k; 
+  
+  if((graph->outputPer == TIMESTEP) || 
+     (targetLayer->type == LSTM_LAYER) ||
+     (graph->outputPer == SEQUENCE && graph->currentSequence[j]->length == t+1)) {
+        
+    for(k = 0; k < layer->layerSize; k++) {
+      targetLayer->x[t][j][k+offset] = layer->y[t][j][k];
+    }    
+  } else {
+    memset(targetLayer->x[t][j], 0, sizeof(FLOAT) * targetLayer->inputSize);
+  }
+}
+
+void backwardPass(graph_t *graph, int j) {
+  int t, length;
+  length = graph->currentSequence[j]->length;
+  
+  if(graph->outputPer == TIMESTEP) {
+    for(t = length-1; t >= 0; t--) { //in any order 
+      backwardPassOutputLayer(graph, t, j);
+    }    
+  } else { //SEQUENCE 
+    backwardPassOutputLayer(graph, length-1, j);
+  }            
+
+  for(t = length-1; t >= 0; t--) { //sequential
+    //printf("bp %d\n", t);
+    backwardPassLstmLayers(graph, t, j, length-1);
+  }
+}
+
+void backwardPassLstmLayers(graph_t *graph, int t, int j, int T) {
+  int i, offset;
+    
+  offset = graph->numInputLayers;  
+  for(i = graph->numLstmLayers-1; i >= 0; i--) {
+    backwardPassLstmLayer(graph, &(graph->layers[offset + i]), t, j, T);
+  }
+}
+
+void backwardPassLstmLayer(graph_t *graph, layer_t *layer, int t, int j, int T) {
+  int i, k, offset;
+  layer_t *targetLayer;
+  
+  for(i = 0; i < layer->nrTargetLayers; i++) {
+    targetLayer = layer->targetLayers[i];
+    
+    if((graph->outputPer == TIMESTEP) || 
+       (targetLayer->type == LSTM_LAYER) ||
+       (graph->outputPer == SEQUENCE && graph->currentSequence[j]->length == t+1)) {
+      offset = layer->targetArrayOffsets[i];
+      
+      if(i == 0) {
+        for(k = 0; k < layer->layerSize; k++) {
+          layer->d[t][j][k] = targetLayer->dx[t][j][k+offset];
+        }
+      } else {
+        for(k = 0; k < layer->layerSize; k++) {
+          layer->d[t][j][k] += targetLayer->dx[t][j][k+offset];
+        }
+      }
+    } else {
+      memset(layer->d[t][j], 0, sizeof(FLOAT) * layer->layerSize);
+    }
+  }
+  
+  //sequential
+  lstmCalculateDy(layer, t, j, T);
+  
+  if(layer->lstmLayer->isTargetOfInputLayer == false) {
+    lstmCalculateDx(layer, t, j);
+  }
+}
+
+void backwardPassOutputLayer(graph_t *graph, int t, int j) {
+  outputCalculateDx(&(graph->layers[graph->outputLayerOffset]), t, j);
+}
+
+//TODO check 1
+cilk void mtbackwardPass(graph_t *graph, int j) {
+  int t, length;
+  length = graph->currentSequence[j]->length;
+  
+  if(graph->outputPer == TIMESTEP) {
+    for(t = length-1; t >= 0; t--) { //in any order 
+      spawn mtbackwardPassOutputLayer(graph, t, j);
+    }    
+  } else { //SEQUENCE 
+    spawn mtbackwardPassOutputLayer(graph, length-1, j);
+  } 
+  sync;
+    
+
+  for(t = length-1; t >= 0; t--) { //sequential
+    //printf("bp %d\n", t);
+    spawn mtbackwardPassLstmLayers(graph, t, j, length-1);
+    sync;
+  }
+}
+
+cilk void mtbackwardPassLstmLayers(graph_t *graph, int t, int j, int T) {
+  int i, offset;
+    
+  offset = graph->numInputLayers;  
+  //TODO probably parallel stuff, fix this all lstm layers are parallel now
+  for(i = graph->numLstmLayers-1; i >= 0; i--) {
+    spawn mtbackwardPassLstmLayer(graph, &(graph->layers[offset + i]), t, j, T);
+  }
+}
+
+cilk void mtbackwardPassLstmLayer(graph_t *graph, layer_t *layer, int t, int j, int T) {
+  int i, k, offset;
+  layer_t *targetLayer;
+  
+  for(i = 0; i < layer->nrTargetLayers; i++) {
+    targetLayer = layer->targetLayers[i];
+    
+    if((graph->outputPer == TIMESTEP) || 
+       (targetLayer->type == LSTM_LAYER) ||
+       (graph->outputPer == SEQUENCE && graph->currentSequence[j]->length == t+1)) {
+      offset = layer->targetArrayOffsets[i];
+      
+      if(i == 0) {
+        for(k = 0; k < layer->layerSize; k++) {
+          layer->d[t][j][k] = targetLayer->dx[t][j][k+offset];
+        }
+      } else {
+        for(k = 0; k < layer->layerSize; k++) {
+          layer->d[t][j][k] += targetLayer->dx[t][j][k+offset];
+        }
+      }
+    } else {
+      memset(layer->d[t][j], 0, sizeof(FLOAT) * layer->layerSize);
+    }
+  }
+  
+  //sequential
+  spawn mtlstmCalculateDy(layer, t, j, T);
+  sync; 
+  
+  if(layer->lstmLayer->isTargetOfInputLayer == false) {
+    spawn mtlstmCalculateDx(layer, t, j);
+  }
+}
+
+cilk void mtbackwardPassOutputLayer(graph_t *graph, int t, int j) {
+  spawn mtoutputCalculateDx(&(graph->layers[graph->outputLayerOffset]), t, j);
+}
+
+void updateWeights(graph_t *graph) {
+  layer_t *layers = graph->layers;
+  int i, numLayers = graph->numLayers;  
+  
+  for(i = 0; i < numLayers; i++) { //parallel
+    updateWeightsLayer(graph, &(layers[i]));
+  }
+}
+
+void updateWeightsLayer(graph_t *graph, layer_t *layer) {
+  switch(layer->type) {
+    case INPUT_LAYER:
+      break;
+    case LSTM_LAYER:
+      updateWeightsLstmLayer(graph, layer);
+      break;
+    case OUTPUT_LAYER:
+      updateWeightsOutputLayer(graph, layer);    
+      break;
+    default:
+      printError("unknown layer type in update weights", stderr, false);
+  }
+}
+
+void updateWeightsLstmLayer(graph_t *graph, layer_t *layer) {
+  int i, j, cur, prev;
+  lstm_t *lstm = layer->lstmLayer;
+
+  cur = layer->cur;
+  prev = layer->prev;
+    
+  //update b parallel with W and R
+  for(i = 0; i < layer->layerSize; i++) {
+    for(j = 1; j < graph->minibatchSize; j++) {     
+      lstm->dbz[cur][0][i] += lstm->dbz[cur][j][i];    
+      lstm->dbi[cur][0][i] += lstm->dbi[cur][j][i];    
+      lstm->dbf[cur][0][i] += lstm->dbf[cur][j][i];    
+      lstm->dbo[cur][0][i] += lstm->dbo[cur][j][i];
+    }
+    lstm->dbz[cur][0][i] /= graph->minibatchSize;
+    lstm->dbi[cur][0][i] /= graph->minibatchSize;
+    lstm->dbf[cur][0][i] /= graph->minibatchSize;
+    lstm->dbo[cur][0][i] /= graph->minibatchSize;    
+    
+    lstm->bz[i] -= layer->learningRate * (lstm->dbz[cur][0][i] + layer->momentum * lstm->dbz[prev][0][i]);
+    lstm->bi[i] -= layer->learningRate * (lstm->dbi[cur][0][i] + layer->momentum * lstm->dbi[prev][0][i]);
+    lstm->bf[i] -= layer->learningRate * (lstm->dbf[cur][0][i] + layer->momentum * lstm->dbf[prev][0][i]);
+    lstm->bo[i] -= layer->learningRate * (lstm->dbo[cur][0][i] + layer->momentum * lstm->dbo[prev][0][i]);
+  }
+  
+  //update W
+  for(i = 0; i < layer->layerSize * layer->inputSize; i++) {
+    for(j = 1; j < graph->minibatchSize; j++) {      
+      lstm->dWz[cur][0][i] += lstm->dWz[cur][j][i];    
+      lstm->dWi[cur][0][i] += lstm->dWi[cur][j][i];    
+      lstm->dWf[cur][0][i] += lstm->dWf[cur][j][i];    
+      lstm->dWo[cur][0][i] += lstm->dWo[cur][j][i];
+    }
+    lstm->dWz[cur][0][i] /= graph->minibatchSize;
+    lstm->dWi[cur][0][i] /= graph->minibatchSize;
+    lstm->dWf[cur][0][i] /= graph->minibatchSize;
+    lstm->dWo[cur][0][i] /= graph->minibatchSize; 
+    
+    lstm->Wz[i] -= layer->learningRate * (lstm->dWz[cur][0][i] + layer->momentum * lstm->dWz[prev][0][i]);
+    lstm->Wi[i] -= layer->learningRate * (lstm->dWi[cur][0][i] + layer->momentum * lstm->dWi[prev][0][i]);
+    lstm->Wf[i] -= layer->learningRate * (lstm->dWf[cur][0][i] + layer->momentum * lstm->dWf[prev][0][i]);
+    lstm->Wo[i] -= layer->learningRate * (lstm->dWo[cur][0][i] + layer->momentum * lstm->dWo[prev][0][i]);
+  }
+  
+  //update R
+  for(i = 0; i < layer->layerSize * layer->layerSize; i++) {
+    for(j = 1; j < graph->minibatchSize; j++) {      
+      lstm->dRz[cur][0][i] += lstm->dRz[cur][j][i];    
+      lstm->dRi[cur][0][i] += lstm->dRi[cur][j][i];    
+      lstm->dRf[cur][0][i] += lstm->dRf[cur][j][i];    
+      lstm->dRo[cur][0][i] += lstm->dRo[cur][j][i];
+    }
+    lstm->dRz[cur][0][i] /= graph->minibatchSize;
+    lstm->dRi[cur][0][i] /= graph->minibatchSize;
+    lstm->dRf[cur][0][i] /= graph->minibatchSize;
+    lstm->dRo[cur][0][i] /= graph->minibatchSize;
+    
+    lstm->Rz[i] -= layer->learningRate * (lstm->dRz[cur][0][i] + layer->momentum * lstm->dRz[prev][0][i]);
+    lstm->Ri[i] -= layer->learningRate * (lstm->dRi[cur][0][i] + layer->momentum * lstm->dRi[prev][0][i]);
+    lstm->Rf[i] -= layer->learningRate * (lstm->dRf[cur][0][i] + layer->momentum * lstm->dRf[prev][0][i]);
+    lstm->Ro[i] -= layer->learningRate * (lstm->dRo[cur][0][i] + layer->momentum * lstm->dRo[prev][0][i]);
+  }
+  
+  layer->cur = prev;
+  layer->prev = cur;
+}
+
+void updateWeightsOutputLayer(graph_t *graph, layer_t *layer) {
+  int i, j, t, sumSequenceLength, cur, prev;
+  FLOAT sum;
+  output_t *output = layer->outputLayer;
+  
+  cur = layer->cur;
+  prev = layer->prev;
+  
+  //update b also parallel to W
+  for(i = 0; i < layer->layerSize; i++) {
+    sum = 0;
+    sumSequenceLength = 0;
+    for(j = 0; j < graph->minibatchSize; j++) {
+      sumSequenceLength += graph->currentSequence[j]->length;
+      for(t = 0; t < graph->currentSequence[j]->length; t++) {
+        sum += output->db[cur][t][j][i];
+      }
+    }
+    output->b[i] -= layer->learningRate * sum / (graph->minibatchSize * sumSequenceLength);
+  }
+  
+  //update W
+  for(i = 0; i < layer->inputSize * layer->layerSize; i++) { //parallel
+    sum = 0;
+    sumSequenceLength = 0;
+    for(j = 0; j < graph->minibatchSize; j++) {  
+      sumSequenceLength += graph->currentSequence[j]->length;
+      for(t = 0; t < graph->currentSequence[j]->length; t++) {    
+        sum += output->dW[cur][t][j][i];
+      }
+    }      
+    output->W[i] -= layer->learningRate * sum / (graph->minibatchSize * sumSequenceLength);
+  }  
+  
+  layer->cur = prev;
+  layer->prev = cur;
+}
+
+cilk void mtupdateWeights(graph_t *graph) {
+  layer_t *layers = graph->layers;
+  int i, numLayers = graph->numLayers;  
+  
+  for(i = 0; i < numLayers; i++) { //parallel
+    updateWeightsLayer(graph, &(layers[i]));
+  }
+}
+
+cilk void mtupdateWeightsLayer(graph_t *graph, layer_t *layer) {
+  switch(layer->type) {
+    case INPUT_LAYER:
+      break;
+    case LSTM_LAYER:
+      updateWeightsLstmLayer(graph, layer);
+      break;
+    case OUTPUT_LAYER:
+      updateWeightsOutputLayer(graph, layer);    
+      break;
+    default:
+      printError("unknown layer type in update weights", stderr, false);
+  }
+}
+
+cilk void mtupdateWeightsLstmLayer(graph_t *graph, layer_t *layer) {
+  int i, j, cur, prev;
+  lstm_t *lstm = layer->lstmLayer;
+
+  cur = layer->cur;
+  prev = layer->prev;
+    
+  //update b parallel with W and R
+  for(i = 0; i < layer->layerSize; i++) {
+    for(j = 1; j < graph->minibatchSize; j++) {     
+      lstm->dbz[cur][0][i] += lstm->dbz[cur][j][i];    
+      lstm->dbi[cur][0][i] += lstm->dbi[cur][j][i];    
+      lstm->dbf[cur][0][i] += lstm->dbf[cur][j][i];    
+      lstm->dbo[cur][0][i] += lstm->dbo[cur][j][i];
+    }
+    lstm->dbz[cur][0][i] /= graph->minibatchSize;
+    lstm->dbi[cur][0][i] /= graph->minibatchSize;
+    lstm->dbf[cur][0][i] /= graph->minibatchSize;
+    lstm->dbo[cur][0][i] /= graph->minibatchSize;    
+    
+    lstm->bz[i] -= layer->learningRate * (lstm->dbz[cur][0][i] + layer->momentum * lstm->dbz[prev][0][i]);
+    lstm->bi[i] -= layer->learningRate * (lstm->dbi[cur][0][i] + layer->momentum * lstm->dbi[prev][0][i]);
+    lstm->bf[i] -= layer->learningRate * (lstm->dbf[cur][0][i] + layer->momentum * lstm->dbf[prev][0][i]);
+    lstm->bo[i] -= layer->learningRate * (lstm->dbo[cur][0][i] + layer->momentum * lstm->dbo[prev][0][i]);
+  }
+  
+  //update W
+  for(i = 0; i < layer->layerSize * layer->inputSize; i++) {
+    for(j = 1; j < graph->minibatchSize; j++) {      
+      lstm->dWz[cur][0][i] += lstm->dWz[cur][j][i];    
+      lstm->dWi[cur][0][i] += lstm->dWi[cur][j][i];    
+      lstm->dWf[cur][0][i] += lstm->dWf[cur][j][i];    
+      lstm->dWo[cur][0][i] += lstm->dWo[cur][j][i];
+    }
+    lstm->dWz[cur][0][i] /= graph->minibatchSize;
+    lstm->dWi[cur][0][i] /= graph->minibatchSize;
+    lstm->dWf[cur][0][i] /= graph->minibatchSize;
+    lstm->dWo[cur][0][i] /= graph->minibatchSize; 
+    
+    lstm->Wz[i] -= layer->learningRate * (lstm->dWz[cur][0][i] + layer->momentum * lstm->dWz[prev][0][i]);
+    lstm->Wi[i] -= layer->learningRate * (lstm->dWi[cur][0][i] + layer->momentum * lstm->dWi[prev][0][i]);
+    lstm->Wf[i] -= layer->learningRate * (lstm->dWf[cur][0][i] + layer->momentum * lstm->dWf[prev][0][i]);
+    lstm->Wo[i] -= layer->learningRate * (lstm->dWo[cur][0][i] + layer->momentum * lstm->dWo[prev][0][i]);
+  }
+  
+  //update R
+  for(i = 0; i < layer->layerSize * layer->layerSize; i++) {
+    for(j = 1; j < graph->minibatchSize; j++) {      
+      lstm->dRz[cur][0][i] += lstm->dRz[cur][j][i];    
+      lstm->dRi[cur][0][i] += lstm->dRi[cur][j][i];    
+      lstm->dRf[cur][0][i] += lstm->dRf[cur][j][i];    
+      lstm->dRo[cur][0][i] += lstm->dRo[cur][j][i];
+    }
+    lstm->dRz[cur][0][i] /= graph->minibatchSize;
+    lstm->dRi[cur][0][i] /= graph->minibatchSize;
+    lstm->dRf[cur][0][i] /= graph->minibatchSize;
+    lstm->dRo[cur][0][i] /= graph->minibatchSize;
+    
+    lstm->Rz[i] -= layer->learningRate * (lstm->dRz[cur][0][i] + layer->momentum * lstm->dRz[prev][0][i]);
+    lstm->Ri[i] -= layer->learningRate * (lstm->dRi[cur][0][i] + layer->momentum * lstm->dRi[prev][0][i]);
+    lstm->Rf[i] -= layer->learningRate * (lstm->dRf[cur][0][i] + layer->momentum * lstm->dRf[prev][0][i]);
+    lstm->Ro[i] -= layer->learningRate * (lstm->dRo[cur][0][i] + layer->momentum * lstm->dRo[prev][0][i]);
+  }
+  
+  layer->cur = prev;
+  layer->prev = cur;
+}
+
+cilk void mtupdateWeightsOutputLayer(graph_t *graph, layer_t *layer) {
+  int i, j, t, sumSequenceLength, cur, prev;
+  FLOAT sum;
+  output_t *output = layer->outputLayer;
+  
+  cur = layer->cur;
+  prev = layer->prev;
+  
+  //update b also parallel to W
+  for(i = 0; i < layer->layerSize; i++) {
+    sum = 0;
+    sumSequenceLength = 0;
+    for(j = 0; j < graph->minibatchSize; j++) {
+      sumSequenceLength += graph->currentSequence[j]->length;
+      for(t = 0; t < graph->currentSequence[j]->length; t++) {
+        sum += output->db[cur][t][j][i];
+      }
+    }
+    output->b[i] -= layer->learningRate * sum / (graph->minibatchSize * sumSequenceLength);
+  }
+  
+  //update W
+  for(i = 0; i < layer->inputSize * layer->layerSize; i++) { //parallel
+    sum = 0;
+    sumSequenceLength = 0;
+    for(j = 0; j < graph->minibatchSize; j++) {  
+      sumSequenceLength += graph->currentSequence[j]->length;
+      for(t = 0; t < graph->currentSequence[j]->length; t++) {    
+        sum += output->dW[cur][t][j][i];
+      }
+    }      
+    output->W[i] -= layer->learningRate * sum / (graph->minibatchSize * sumSequenceLength);
+  }  
+  
+  layer->cur = prev;
+  layer->prev = cur;
+}
+
+error_t calculateError(graph_t *graph, data_t *data) {
+  int i;
+  layer_t *out = &(graph->layers[graph->outputLayerOffset]);
+  error_t tempE, e = {.type = out->outputLayer->type == SOFTMAX, .correct = 0, .incorrect = 0, .error = 0};
+ 
+  for(i = 0; i < data->numSequences; i++) {
+    tempE = calculateErrorSequence(graph, &(data->sequences[i]), data->numOutputs);
+    addError(&e, tempE);
+  }
+ 
+  if(e.type == SOFTMAX) {
+    e.error = ((FLOAT)e.incorrect) / ((FLOAT)(e.incorrect + e.correct)); 
+  }
+  
+  return e;
+}
+
+
+error_t calculateErrorSequence(graph_t *graph, sequence_t *sequence, int numOutputs) {
+  int t, T, b = 0;
+  FLOAT ***target, ***y; 
+  layer_t *out = &(graph->layers[graph->outputLayerOffset]);
+  error_t tempE, e = {.type = out->outputLayer->type == SOFTMAX, .correct = 0, .incorrect = 0, .error = 0};
+   
+  forwardPass(graph, sequence, b);
+  target = out->outputLayer->target;
+  y = out->y;
+  T = sequence->length - 1;
+      
+  if(out->outputLayer->type == SOFTMAX) {
+    if(graph->outputPer == TIMESTEP) {
+      for(t = 0; t <= T; t++) {
+        tempE = calculateErrorSoftmax(y[t][b], target[t][b], numOutputs);
+        addError(&e, tempE);
+      }
+    } else {
+      e = calculateErrorSoftmax(y[T][b], target[T][b], numOutputs);
+    }
+    
+  } else {
+    if(graph->outputPer == TIMESTEP) {
+      for(t = 0; t <= T; t++) {
+        tempE = calculateErrorMse(y[t][b], target[t][b], numOutputs);
+        addError(&e, tempE);
+      }
+    } else {
+      e = calculateErrorMse(y[T][b], target[T][b], numOutputs);
+    }
+  }
+  
+  return e;
+}
+
+error_t calculateErrorSoftmax(FLOAT *y, FLOAT *target, int n) {
+  int i, idxMax;
+  FLOAT max;
+  error_t e = {.type = SOFTMAX, .correct = 0, .incorrect = 0, .error = 0};
+  
+  idxMax = 0;
+  max = 0;
+  
+  for(i = 0; i < n; i++) {
+    if(max < y[i]) {
+      idxMax = i;
+      max = y[i];
+    }
+  }
+  
+  if(target[idxMax] == 1.0) {
+    e.correct = 1;
+  } else {
+    e.incorrect = 1;
+  }
+  
+  return e;
+}
+
+error_t calculateErrorMse(FLOAT *y, FLOAT *target, int n) {
+  error_t e = {.type = MSE, .correct = 0, .incorrect = 0, .error = 0};
+  
+  //TODO
+  printError("not yet implemented", stderr, true);
+  
+  return e;
+}
+
+cilk error_t mtcalculateError(graph_t *graph, data_t *data, int i0, int i1) {
+  layer_t *out = &(graph->layers[graph->outputLayerOffset]);
+  error_t tempE, e = {.type = out->outputLayer->type == SOFTMAX, .correct = 0, .incorrect = 0, .error = 0};
+ 
+  if (i1 - i0 <= LEAFSIZE) {
+    int i;
+    for (i = i0; i < i1; i++) {
+      tempE = spawn mtcalculateErrorSequence(graph, &(data->sequences[i]), data->numOutputs);
+      addError(&e, tempE);
+    }
+  } else {
+    int im = (i0 + i1) / 2;
+    e     = spawn mtcalculateError(graph, data, i0, im);
+    tempE = spawn mtcalculateError(graph, data, im, i1);
+    sync;
+    addError(&e, tempE);
+  }
+  
+  if(e.type == SOFTMAX) {
+    e.error = ((FLOAT)e.incorrect) / ((FLOAT)(e.incorrect + e.correct)); 
+  }
+  
+  return e;
+}
+
+cilk error_t mtcalculateErrorSequence(graph_t *graph, sequence_t *sequence, int numOutputs) {
+  int t, T, b = 0;
+  FLOAT ***target, ***y; 
+  layer_t *out = &(graph->layers[graph->outputLayerOffset]);
+  error_t tempE, e = {.type = out->outputLayer->type == SOFTMAX, .correct = 0, .incorrect = 0, .error = 0};
+   
+  forwardPass(graph, sequence, b);
+  target = out->outputLayer->target;
+  y = out->y;
+  T = sequence->length - 1;
+      
+  if(out->outputLayer->type == SOFTMAX) {
+    if(graph->outputPer == TIMESTEP) {
+      for(t = 0; t <= T; t++) {
+        tempE = calculateErrorSoftmax(y[t][b], target[t][b], numOutputs);
+        addError(&e, tempE);
+      }
+    } else {
+      e = calculateErrorSoftmax(y[T][b], target[T][b], numOutputs);
+    }
+    
+  } else {
+    if(graph->outputPer == TIMESTEP) {
+      for(t = 0; t <= T; t++) {
+        tempE = calculateErrorMse(y[t][b], target[t][b], numOutputs);
+        addError(&e, tempE);
+      }
+    } else {
+      e = calculateErrorMse(y[T][b], target[T][b], numOutputs);
+    }
+  }
+  
+  return e;
+}
+
+cilk error_t mtcalculateErrorSoftmax(FLOAT *y, FLOAT *target, int n) {
+  int i, idxMax;
+  FLOAT max;
+  error_t e = {.type = SOFTMAX, .correct = 0, .incorrect = 0, .error = 0};
+  
+  idxMax = 0;
+  max = 0;
+  
+  for(i = 0; i < n; i++) {
+    if(max < y[i]) {
+      idxMax = i;
+      max = y[i];
+    }
+  }
+  
+  if(target[idxMax] == 1.0) {
+    e.correct = 1;
+  } else {
+    e.incorrect = 1;
+  }
+  
+  return e;
+}
+
+cilk error_t mtcalculateErrorMse(FLOAT *y, FLOAT *target, int n) {
+  error_t e = {.type = MSE, .correct = 0, .incorrect = 0, .error = 0};
+  
+  //TODO
+  printError("not yet implemented", stderr, true);
+  
+  return e;
+}
+
+void addError(error_t *e1, error_t e2) {
+  if(e1->type == SOFTMAX) {
+    e1->correct   += e2.correct;
+    e1->incorrect += e2.incorrect;
+  } else {
+    e1->error += e2.error;
+  }
+}
+
+void shuffleVector(int *v, int n) {
+  if(n > 1) {
+    size_t i;
+    for(i = 0; i < n - 1; i++) {
+      size_t j = i + rand() / (RAND_MAX / (n - i) + 1);
+      int t = v[j];
+      v[j] = v[i];
+      v[i] = t;
+    }
+  }
+}
+
+cilk void mtshuffleVector(int *v, int n) {
+  if(n > 1) {
+    size_t i;
+    for(i = 0; i < n - 1; i++) {
+      size_t j = i + rand() / (RAND_MAX / (n - i) + 1);
+      int t = v[j];
+      v[j] = v[i];
+      v[i] = t;
+    }
+  }
+}
+
+void setInputSequence(layer_t *layer, FLOAT **x, int sequenceLength, int j, int direction) {
+  int t;
+
+  if(direction == FORWARD) {
+    for(t = 0; t < sequenceLength; t++) {
+      setInputTimestep(layer, x[t], t, j);
+    }
+  } else {
+    for(t = 0; t < sequenceLength; t++) {
+      setInputTimestep(layer, x[sequenceLength - 1 - t], t, j);
+    }
+  }
+}
+
+void setInputTimestep(layer_t *layer, FLOAT *x, int t, int j) {  
+  layer->x[t][j] = x;
+}
+
+void setOutputSequence(layer_t *layer, FLOAT **target, int sequenceLength, int j, int direction) {
+  int t;
+  
+  if(direction == FORWARD) {
+    for(t = 0; t < sequenceLength; t++) {
+      setOutputTimestep(layer, target[t], t, j);
+    }
+  } else {
+    for(t = 0; t < sequenceLength; t++) {
+      setOutputTimestep(layer, target[sequenceLength - 1 - t], t, j);
+    }
+  }
+}
+
+void setOutputTimestep(layer_t *layer, FLOAT *target, int t, int j) {
+  if(layer->type == OUTPUT_LAYER) {
+    layer->outputLayer->target[t][j] = target;
+  } 
+}
+
+cilk void mtsetInputSequence(layer_t *layer, FLOAT **x, int sequenceLength, int t0, int t1, int j, int direction) {
+  if (t1 - t0 <= LEAFSIZE) {
+    int t;
+    if(direction == FORWARD) {
+      for(t = t0; t < t1; t++) {
+        setInputTimestep(layer, x[t], t, j);
+      }
+    } else {
+      for(t = t0; t < t1; t++) {
+        setInputTimestep(layer, x[sequenceLength - 1 - t], t, j);
+      }
+    }
+  } else {
+    int tm = (t0 + t1) / 2;
+    spawn mtsetInputSequence(layer, x, sequenceLength, t0, tm, j, direction);
+    spawn mtsetInputSequence(layer, x, sequenceLength, tm, t1, j, direction);
+  }
+}
+
+cilk void mtsetOutputSequence(layer_t *layer, FLOAT **target, int sequenceLength, int t0, int t1, int j, int direction) {
+  if (t1 - t0 <= LEAFSIZE) {
+    int t;
+    if(direction == FORWARD) {
+      for(t = t0; t < t1; t++) {
+        setOutputTimestep(layer, target[t], t, j);
+      }
+    } else {
+      for(t = t0; t < t1; t++) {
+        setOutputTimestep(layer, target[sequenceLength - 1 - t], t, j);
+      }
+    }
+  } else {
+    int tm = (t0 + t1) / 2;
+    spawn mtsetOutputSequence(layer, target, sequenceLength, t0, tm, j, direction);
+    spawn mtsetOutputSequence(layer, target, sequenceLength, tm, t1, j, direction);
+  }
+}
+
+void matrixVectorMul(FLOAT *a, FLOAT *v, int m, int n, FLOAT *result) {
+  int i, j;
+  
+  for(i = 0; i < m; i++) {
+    result[i] = 0;
+    for(j = 0; j < n; j++) {
+      result[i] += a[i*n+j] * v[j];
+    }
+  }
+}
+
+void matrixTransposedVectorMul(FLOAT *a, FLOAT *v, int m, int n, FLOAT *result) {
+  int i, j;
+  
+  for(i = 0; i < m; i++) {
+    result[i] = 0;
+    for(j = 0; j < n; j++) {
+      result[i] += a[j*m+i] * v[j];
+    }
+  }
+}
+
+void applyFunction(FLOAT (*f)(FLOAT), FLOAT *v, int n, FLOAT *result) {
+  int i;
+  
+  for(i = 0; i < n; i++) {
+    result[i] = (*f)(v[i]);
+  }
+}
+
+void vectorAdd2(FLOAT *v1, FLOAT *v2, int n, FLOAT *result) {
+  int i;
+  for(i = 0; i < n; i++) {
+    result[i] = v1[i] + v2[i];
+  }
+}
+
+void vectorAdd3(FLOAT *v1, FLOAT *v2, FLOAT *v3, int n, FLOAT *result) {
+  int i;
+  
+  for(i = 0; i < n; i++) {
+    result[i] = v1[i] + v2[i] + v3[i];
+  }
+}
+
+void vectorAdd4(FLOAT *v1, FLOAT *v2, FLOAT *v3, FLOAT *v4, int n, FLOAT *result) {
+  int i;
+  for(i = 0; i < n; i++) {
+    result[i] = v1[i] + v2[i] + v3[i] + v4[i];
+  }
+}
+
+void vectorAdd5(FLOAT *v1, FLOAT *v2, FLOAT *v3, FLOAT *v4, FLOAT *v5, int n, FLOAT *result) {
+  int i;
+  
+  for(i = 0; i < n; i++) {
+    result[i] = v1[i] + v2[i] + v3[i] + v4[i] + v5[i];
+  }  
+}
+
+void lstmCalculateZbar(layer_t *layer, int t, int j) {
+  lstm_t *lstm = layer->lstmLayer;
+  int layerSize = layer->layerSize;
+  int inputSize = layer->inputSize;
+  
+  //ztemp1 = Wz*x(t)
+  matrixVectorMul(lstm->Wz, layer->x[t][j], layerSize, inputSize, lstm->ztemp1[t][j]);
+    
+  if(t != 0) { 
+    //ztemp2 = Rz*y(t-1)
+    matrixVectorMul(lstm->Rz, layer->y[t-1][j], layerSize, layerSize, lstm->ztemp2[t][j]);
+    
+    //zbar = ztemp1 + ztemp2 + bz
+    vectorAdd3(lstm->ztemp1[t][j], lstm->ztemp2[t][j], lstm->bz, layerSize, lstm->zbar[t][j]);
+  } 
+  else {
+    //zbar(t) = ztemp1 + bz
+    vectorAdd2(lstm->ztemp1[t][j], lstm->bz, layerSize, lstm->zbar[t][j]);
+  }
+}
+
+void lstmCalculateZ(layer_t *layer, int t, int j) {
+  lstm_t *lstm = layer->lstmLayer;
+  int layerSize = layer->layerSize;
+  
+  lstmCalculateZbar(layer, t, j);  
+  
+  //z(t) = g(zbar(t))
+  applyFunction(lstm->g, lstm->zbar[t][j], layerSize, lstm->z[t][j]);
+}
+
+void lstmCalculateIbar(layer_t *layer, int t, int j) {
+  lstm_t *lstm = layer->lstmLayer;
+  int layerSize = layer->layerSize;
+  int inputSize = layer->inputSize;
+  
+  //itemp1 = Wi*x(t)
+  matrixVectorMul(lstm->Wi, layer->x[t][j], layerSize, inputSize, lstm->itemp1[t][j]);
+    
+  if(t != 0) { 
+    //itemp2 = Ri*y(t-1)
+    matrixVectorMul(lstm->Ri, layer->y[t-1][j], layerSize, layerSize, lstm->itemp2[t][j]);
+    
+    //zbar = itemp1 + itemp2 + bi
+    vectorAdd3(lstm->itemp1[t][j], lstm->itemp2[t][j], lstm->bi, layerSize, lstm->ibar[t][j]);
+  } 
+  else {
+    //zbar(t) = itemp1 + bi
+    vectorAdd2(lstm->itemp1[t][j], lstm->bi, layerSize, lstm->ibar[t][j]);
+  }  
+}
+
+void lstmCalculateI(layer_t *layer, int t, int j) {  
+  lstm_t *lstm = layer->lstmLayer;
+  int layerSize = layer->layerSize;
+  
+  lstmCalculateIbar(layer, t, j);  
+  
+  //i(t) = sigmoid(ibar(t))
+  applyFunction(sigmoid, lstm->ibar[t][j], layerSize, lstm->i[t][j]);
+}
+
+void lstmCalculateFbar(layer_t *layer, int t, int j) {
+  lstm_t *lstm = layer->lstmLayer;
+  int layerSize = layer->layerSize;
+  int inputSize = layer->inputSize;
+  
+  //ftemp1 = Wf*x(t)
+  matrixVectorMul(lstm->Wf, layer->x[t][j], layerSize, inputSize, lstm->ftemp1[t][j]);
+    
+  if(t != 0) { 
+    //ftemp2 = Rf*y(t-1)
+    matrixVectorMul(lstm->Rf, layer->y[t-1][j], layerSize, layerSize, lstm->ftemp2[t][j]);
+    
+    //fbar = ftemp1 + ftemp2 + bf
+    vectorAdd3(lstm->ftemp1[t][j], lstm->ftemp2[t][j], lstm->bf, layerSize, lstm->fbar[t][j]);
+  } 
+  else {
+    //fbar(t) = ftemp1 + bf
+    vectorAdd2(lstm->ftemp1[t][j], lstm->bf, layerSize, lstm->fbar[t][j]);
+  } 
+}
+
+void lstmCalculateF(layer_t *layer, int t, int j) {
+  lstm_t *lstm = layer->lstmLayer;
+  int layerSize = layer->layerSize;
+  
+  lstmCalculateFbar(layer, t, j);  
+    
+  //f(t) = sigmoid(fbar(t))
+  applyFunction(sigmoid, lstm->fbar[t][j], layerSize, lstm->f[t][j]);
+}
+
+void lstmCalculateC(layer_t *layer, int t, int j) {
+  lstm_t *lstm = layer->lstmLayer;
+  int layerSize = layer->layerSize;
+  int i;
+  
+  //parallel
+  lstmCalculateF(layer, t, j);
+  lstmCalculateZ(layer, t, j);  
+  lstmCalculateI(layer, t, j);  
+  
+  if(t != 0) {
+    //c(t) = z(t)(*)i(t) + c(t-1)(*)f(t)
+    for(i = 0; i < layerSize; i++) {
+      lstm->c[t][j][i] = lstm->z[t][j][i] * 
+                         lstm->i[t][j][i] +                
+                         lstm->c[t-1][j][i] * 
+                         lstm->f[t][j][i];
+    }
+  }
+  else {
+    //c(t) = z(t)(*)i(t)
+    for(i = 0; i < layerSize; i++) {
+      lstm->c[t][j][i] = lstm->z[t][j][i]   * lstm->i[t][j][i];
+    }
+  }
+}
+void lstmCalculateObar(layer_t *layer, int t, int j) {
+  lstm_t *lstm = layer->lstmLayer;
+  int layerSize = layer->layerSize;
+  int inputSize = layer->inputSize;
+  
+  //otemp1 = Wo*x(t)
+  matrixVectorMul(lstm->Wo, layer->x[t][j], layerSize, inputSize, lstm->otemp1[t][j]);
+    
+  if(t != 0) { 
+    //otemp2 = Ro*y(t-1)
+    matrixVectorMul(lstm->Ro, layer->y[t-1][j], layerSize, layerSize, lstm->otemp2[t][j]);
+    
+    //obar = otemp1 + otemp2 + bo
+    vectorAdd3(lstm->otemp1[t][j], lstm->otemp2[t][j], lstm->bo, layerSize, lstm->obar[t][j]);
+  } 
+  else {
+    //obar(t) = otemp1 + bo
+    vectorAdd2(lstm->otemp1[t][j], lstm->bo, layerSize, lstm->obar[t][j]);
+  }
+}
+
+void lstmCalculateO(layer_t *layer, int t, int j) {  
+  lstm_t *lstm = layer->lstmLayer;
+  int layerSize = layer->layerSize;
+  lstmCalculateObar(layer, t, j);
+  
+  //o(t) = sigmoid(obar(t))
+  applyFunction(sigmoid, lstm->obar[t][j], layerSize, lstm->o[t][j]);
+}
+
+void lstmCalculateY(layer_t *layer, int t, int j) {
+  lstm_t *lstm = layer->lstmLayer;
+  int layerSize = layer->layerSize;
+  int i;
+  
+  lstmCalculateO(layer, t, j);
+  lstmCalculateC(layer, t, j);  
+  
+  //y(t) = h(c(t)) (*) o(t)
+  for(i = 0; i < layerSize; i++) {
+    lstm->h_of_c[t][j][i] = lstm->h(lstm->c[t][j][i]);
+    layer->y[t][j][i] = lstm->h_of_c[t][j][i] * lstm->o[t][j][i];
+  }
+}
+
+cilk void mtlstmCalculateZbar(layer_t *layer, int t, int j) {
+  lstm_t *lstm = layer->lstmLayer;
+  int layerSize = layer->layerSize;
+  int inputSize = layer->inputSize;
+  
+  //ztemp1 = Wz*x(t)
+  matrixVectorMul(lstm->Wz, layer->x[t][j], layerSize, inputSize, lstm->ztemp1[t][j]);
+    
+  if(t != 0) { 
+    //ztemp2 = Rz*y(t-1)
+    matrixVectorMul(lstm->Rz, layer->y[t-1][j], layerSize, layerSize, lstm->ztemp2[t][j]);
+    
+    //zbar = ztemp1 + ztemp2 + bz
+    vectorAdd3(lstm->ztemp1[t][j], lstm->ztemp2[t][j], lstm->bz, layerSize, lstm->zbar[t][j]);
+  } 
+  else {
+    //zbar(t) = ztemp1 + bz
+    vectorAdd2(lstm->ztemp1[t][j], lstm->bz, layerSize, lstm->zbar[t][j]);
+  }
+}
+
+cilk void mtlstmCalculateZ(layer_t *layer, int t, int j) {
+  lstm_t *lstm = layer->lstmLayer;
+  int layerSize = layer->layerSize;
+  
+  lstmCalculateZbar(layer, t, j);  
+  
+  //z(t) = g(zbar(t))
+  applyFunction(lstm->g, lstm->zbar[t][j], layerSize, lstm->z[t][j]);
+}
+
+cilk void mtlstmCalculateIbar(layer_t *layer, int t, int j) {
+  lstm_t *lstm = layer->lstmLayer;
+  int layerSize = layer->layerSize;
+  int inputSize = layer->inputSize;
+  
+  //itemp1 = Wi*x(t)
+  matrixVectorMul(lstm->Wi, layer->x[t][j], layerSize, inputSize, lstm->itemp1[t][j]);
+    
+  if(t != 0) { 
+    //itemp2 = Ri*y(t-1)
+    matrixVectorMul(lstm->Ri, layer->y[t-1][j], layerSize, layerSize, lstm->itemp2[t][j]);
+    
+    //zbar = itemp1 + itemp2 + bi
+    vectorAdd3(lstm->itemp1[t][j], lstm->itemp2[t][j], lstm->bi, layerSize, lstm->ibar[t][j]);
+  } 
+  else {
+    //zbar(t) = itemp1 + bi
+    vectorAdd2(lstm->itemp1[t][j], lstm->bi, layerSize, lstm->ibar[t][j]);
+  }  
+}
+
+cilk void mtlstmCalculateI(layer_t *layer, int t, int j) {  
+  lstm_t *lstm = layer->lstmLayer;
+  int layerSize = layer->layerSize;
+  
+  lstmCalculateIbar(layer, t, j);  
+  
+  //i(t) = sigmoid(ibar(t))
+  applyFunction(sigmoid, lstm->ibar[t][j], layerSize, lstm->i[t][j]);
+}
+
+cilk void mtlstmCalculateFbar(layer_t *layer, int t, int j) {
+  lstm_t *lstm = layer->lstmLayer;
+  int layerSize = layer->layerSize;
+  int inputSize = layer->inputSize;
+  
+  //ftemp1 = Wf*x(t)
+  matrixVectorMul(lstm->Wf, layer->x[t][j], layerSize, inputSize, lstm->ftemp1[t][j]);
+    
+  if(t != 0) { 
+    //ftemp2 = Rf*y(t-1)
+    matrixVectorMul(lstm->Rf, layer->y[t-1][j], layerSize, layerSize, lstm->ftemp2[t][j]);
+    
+    //fbar = ftemp1 + ftemp2 + bf
+    vectorAdd3(lstm->ftemp1[t][j], lstm->ftemp2[t][j], lstm->bf, layerSize, lstm->fbar[t][j]);
+  } 
+  else {
+    //fbar(t) = ftemp1 + bf
+    vectorAdd2(lstm->ftemp1[t][j], lstm->bf, layerSize, lstm->fbar[t][j]);
+  } 
+}
+
+cilk void mtlstmCalculateF(layer_t *layer, int t, int j) {
+  lstm_t *lstm = layer->lstmLayer;
+  int layerSize = layer->layerSize;
+  
+  lstmCalculateFbar(layer, t, j);  
+    
+  //f(t) = sigmoid(fbar(t))
+  applyFunction(sigmoid, lstm->fbar[t][j], layerSize, lstm->f[t][j]);
+}
+
+cilk void mtlstmCalculateC(layer_t *layer, int t, int j) {
+  lstm_t *lstm = layer->lstmLayer;
+  int layerSize = layer->layerSize;
+  int i;
+  
+  //parallel
+  lstmCalculateF(layer, t, j);
+  lstmCalculateZ(layer, t, j);  
+  lstmCalculateI(layer, t, j);  
+  
+  if(t != 0) {
+    //c(t) = z(t)(*)i(t) + c(t-1)(*)f(t)
+    for(i = 0; i < layerSize; i++) {
+      lstm->c[t][j][i] = lstm->z[t][j][i] * 
+                         lstm->i[t][j][i] +                
+                         lstm->c[t-1][j][i] * 
+                         lstm->f[t][j][i];
+    }
+  }
+  else {
+    //c(t) = z(t)(*)i(t)
+    for(i = 0; i < layerSize; i++) {
+      lstm->c[t][j][i] = lstm->z[t][j][i]   * lstm->i[t][j][i];
+    }
+  }
+}
+cilk void mtlstmCalculateObar(layer_t *layer, int t, int j) {
+  lstm_t *lstm = layer->lstmLayer;
+  int layerSize = layer->layerSize;
+  int inputSize = layer->inputSize;
+  
+  //otemp1 = Wo*x(t)
+  matrixVectorMul(lstm->Wo, layer->x[t][j], layerSize, inputSize, lstm->otemp1[t][j]);
+    
+  if(t != 0) { 
+    //otemp2 = Ro*y(t-1)
+    matrixVectorMul(lstm->Ro, layer->y[t-1][j], layerSize, layerSize, lstm->otemp2[t][j]);
+    
+    //obar = otemp1 + otemp2 + bo
+    vectorAdd3(lstm->otemp1[t][j], lstm->otemp2[t][j], lstm->bo, layerSize, lstm->obar[t][j]);
+  } 
+  else {
+    //obar(t) = otemp1 + bo
+    vectorAdd2(lstm->otemp1[t][j], lstm->bo, layerSize, lstm->obar[t][j]);
+  }
+}
+
+cilk void mtlstmCalculateO(layer_t *layer, int t, int j) {  
+  lstm_t *lstm = layer->lstmLayer;
+  int layerSize = layer->layerSize;
+  lstmCalculateObar(layer, t, j);
+  
+  //o(t) = sigmoid(obar(t))
+  applyFunction(sigmoid, lstm->obar[t][j], layerSize, lstm->o[t][j]);
+}
+
+cilk void mtlstmCalculateY(layer_t *layer, int t, int j) {
+  lstm_t *lstm = layer->lstmLayer;
+  int layerSize = layer->layerSize;
+  int i;
+  
+  //parallel
+  spawn mtlstmCalculateO(layer, t, j);
+  spawn mtlstmCalculateC(layer, t, j);  
+  sync; 
+  
+  
+  //TODO
+  //y(t) = h(c(t)) (*) o(t)
+  for(i = 0; i < layerSize; i++) {
+    lstm->h_of_c[t][j][i] = lstm->h(lstm->c[t][j][i]);
+    layer->y[t][j][i] = lstm->h_of_c[t][j][i] * lstm->o[t][j][i];
+  }
+}
+
+void lstmCalculateDz(layer_t *layer, int t, int j) {
+  lstm_t *lstm = layer->lstmLayer;
+  int layerSize = layer->layerSize;
+  int i;
+  
+  //dz(t) = dc(t) (*) i(t) (*) g'(zbar(t))
+  for(i = 0; i < layerSize; i++) {
+    lstm->dz[t][j][i] = lstm->dc[t][j][i] * 
+                        lstm->i[t][j][i] *
+                        lstm->dG(lstm->z[t][j][i]);
+  }
+}
+
+void lstmCalculateDi(layer_t *layer, int t, int j) {
+  lstm_t *lstm = layer->lstmLayer;
+  int layerSize = layer->layerSize;
+  int i;
+  
+  //di(t) = dc(t) (*) z(t) (*) sigmoid'(ibar(t))
+  for(i = 0; i < layerSize; i++) {
+    lstm->di[t][j][i] = lstm->dc[t][j][i] * 
+                        lstm->z[t][j][i] *
+                        dSigmoid(lstm->i[t][j][i]);
+  }  
+}
+
+void lstmCalculateDf(layer_t *layer, int t, int j) {
+  lstm_t *lstm = layer->lstmLayer;
+  int layerSize = layer->layerSize;
+  int i;
+  
+  if(t != 0) {
+    //df(t) = dc(t) (*) c(t-1) (*) sigmoid'(fbar(t))
+    for(i = 0; i < layerSize; i++) {
+      lstm->df[t][j][i] = lstm->dc[t][j][i] * 
+                          lstm->c[t-1][j][i] *
+                          dSigmoid(lstm->f[t][j][i]);
+    }
+  }
+  else {
+    //TODO: this can be removed, df(0) is initialized with 0s and is never changed
+    for(i = 0; i < layerSize; i++) {
+      lstm->df[t][j][i] = 0;
+    }
+  }
+}
+
+void lstmCalculateDc(layer_t *layer, int t, int j, int T) {
+  lstm_t *lstm = layer->lstmLayer;
+  int layerSize = layer->layerSize;
+  int i;
+  
+  if(t != T) {
+    for(i = 0; i < layerSize; i++) {
+      lstm->dc[t][j][i] = layer->dy[t][j][i] *
+                          lstm->o[t][j][i] *
+                          lstm->dH(lstm->h_of_c[t][j][i]) +
+                          lstm->dc[t+1][j][i] *
+                          lstm->f[t+1][j][i];
+    }
+  }
+  else {
+    for(i = 0; i < layerSize; i++) {
+      lstm->dc[t][j][i] = layer->dy[t][j][i] *
+                          lstm->o[t][j][i] *
+                          lstm->dH(lstm->h_of_c[t][j][i]);
+    }
+  }
+    
+  //parallel
+  lstmCalculateDf(layer, t, j);
+  lstmCalculateDz(layer, t, j);  
+  lstmCalculateDi(layer, t, j);
+}
+
+void lstmCalculateDo(layer_t *layer, int t, int j) {
+  lstm_t *lstm = layer->lstmLayer;
+  int layerSize = layer->layerSize;
+  int i;
+  
+  //do(t) = dy(t) (*) h(c(t)) (*) sigmoid'(obar(t))
+  for(i = 0; i < layerSize; i++) {
+    lstm->d_o[t][j][i] = layer->dy[t][j][i] * 
+                         lstm->h_of_c[t][j][i] *
+                         dSigmoid(lstm->o[t][j][i]);
+  }
+}
+
+void lstmCalculateDy(layer_t *layer, int t, int j, int T) {
+  int i;
+  int layerSize = layer->layerSize;
+  lstm_t *lstm = layer->lstmLayer;
+  
+  if(t != T) {
+    matrixTransposedVectorMul(lstm->Rz, lstm->dz[t+1][j], layerSize, layerSize, lstm->dyz[t][j]);
+    matrixTransposedVectorMul(lstm->Ri, lstm->di[t+1][j], layerSize, layerSize, lstm->dyi[t][j]);
+    matrixTransposedVectorMul(lstm->Rf, lstm->df[t+1][j], layerSize, layerSize, lstm->dyf[t][j]);
+    matrixTransposedVectorMul(lstm->Ro, lstm->d_o[t+1][j], layerSize, layerSize, lstm->dyo[t][j]);
+    //dy(t) = d(t) + Rz^T * dz(t+1) + Ri^T * di(t+1) + Rf^T * df(t+1) + Ro^T * do(t+1)
+    vectorAdd5(layer->d[t][j], lstm->dyz[t][j], lstm->dyi[t][j], lstm->dyf[t][j], lstm->dyo[t][j], layerSize, layer->dy[t][j]);
+  }
+  else {
+    //dy(t) = d(t)
+    for(i = 0; i < layerSize; i++) {
+      layer->dy[t][j][i] = layer->d[t][j][i];
+    }
+  }
+  
+  //parallel
+  lstmCalculateDo(layer, t, j);
+  lstmCalculateDc(layer, t, j, T);
+  //sync
+}
+
+void lstmCalculateDx(layer_t *layer, int t, int j) {
+  lstm_t *lstm = layer->lstmLayer;
+  int layerSize = layer->layerSize;
+  int inputSize = layer->inputSize;
+  
+  //dztemp = Wz^T * dz(t)
+  matrixTransposedVectorMul(lstm->Wz, lstm->dz[t][j], inputSize, layerSize, lstm->dztemp[t][j]);
+  //ditemp = Wi^T * di(t)
+  matrixTransposedVectorMul(lstm->Wi, lstm->di[t][j], inputSize, layerSize, lstm->ditemp[t][j]);
+  //dftemp = Wf^T * df(t)
+  matrixTransposedVectorMul(lstm->Wf, lstm->df[t][j], inputSize, layerSize, lstm->dftemp[t][j]);
+  //dotemp = Wo^T * do(t)
+  matrixTransposedVectorMul(lstm->Wo, lstm->d_o[t][j], inputSize, layerSize, lstm->dotemp[t][j]);
+  //dx(t) = dztemp + ditemp + dftemp + dotemp
+  vectorAdd4(lstm->dztemp[t][j], lstm->ditemp[t][j], lstm->dftemp[t][j], lstm->dotemp[t][j], inputSize, layer->dx[t][j]);  
+}
+
+cilk void mtlstmCalculateDz(layer_t *layer, int t, int j) {
+  lstm_t *lstm = layer->lstmLayer;
+  int layerSize = layer->layerSize;
+  int i;
+  
+  //dz(t) = dc(t) (*) i(t) (*) g'(zbar(t))
+  for(i = 0; i < layerSize; i++) {
+    lstm->dz[t][j][i] = lstm->dc[t][j][i] * 
+                        lstm->i[t][j][i] *
+                        lstm->dG(lstm->z[t][j][i]);
+  }
+}
+
+cilk void mtlstmCalculateDi(layer_t *layer, int t, int j) {
+  lstm_t *lstm = layer->lstmLayer;
+  int layerSize = layer->layerSize;
+  int i;
+  
+  //di(t) = dc(t) (*) z(t) (*) sigmoid'(ibar(t))
+  for(i = 0; i < layerSize; i++) {
+    lstm->di[t][j][i] = lstm->dc[t][j][i] * 
+                        lstm->z[t][j][i] *
+                        dSigmoid(lstm->i[t][j][i]);
+  }  
+}
+
+cilk void mtlstmCalculateDf(layer_t *layer, int t, int j) {
+  lstm_t *lstm = layer->lstmLayer;
+  int layerSize = layer->layerSize;
+  int i;
+  
+  if(t != 0) {
+    //df(t) = dc(t) (*) c(t-1) (*) sigmoid'(fbar(t))
+    for(i = 0; i < layerSize; i++) {
+      lstm->df[t][j][i] = lstm->dc[t][j][i] * 
+                          lstm->c[t-1][j][i] *
+                          dSigmoid(lstm->f[t][j][i]);
+    }
+  }
+  else {
+    //TODO: this can be removed, df(0) is initialized with 0s and is never changed
+    for(i = 0; i < layerSize; i++) {
+      lstm->df[t][j][i] = 0;
+    }
+  }
+}
+
+cilk void mtlstmCalculateDc(layer_t *layer, int t, int j, int T) {
+  lstm_t *lstm = layer->lstmLayer;
+  int layerSize = layer->layerSize;
+  int i;
+  
+  if(t != T) {
+    for(i = 0; i < layerSize; i++) {
+      lstm->dc[t][j][i] = layer->dy[t][j][i] *
+                          lstm->o[t][j][i] *
+                          lstm->dH(lstm->h_of_c[t][j][i]) +
+                          lstm->dc[t+1][j][i] *
+                          lstm->f[t+1][j][i];
+    }
+  }
+  else {
+    for(i = 0; i < layerSize; i++) {
+      lstm->dc[t][j][i] = layer->dy[t][j][i] *
+                          lstm->o[t][j][i] *
+                          lstm->dH(lstm->h_of_c[t][j][i]);
+    }
+  }
+    
+  //parallel
+  lstmCalculateDf(layer, t, j);
+  lstmCalculateDz(layer, t, j);  
+  lstmCalculateDi(layer, t, j);
+}
+
+cilk void mtlstmCalculateDo(layer_t *layer, int t, int j) {
+  lstm_t *lstm = layer->lstmLayer;
+  int layerSize = layer->layerSize;
+  int i;
+  
+  //do(t) = dy(t) (*) h(c(t)) (*) sigmoid'(obar(t))
+  for(i = 0; i < layerSize; i++) {
+    lstm->d_o[t][j][i] = layer->dy[t][j][i] * 
+                         lstm->h_of_c[t][j][i] *
+                         dSigmoid(lstm->o[t][j][i]);
+  }
+}
+
+cilk void mtlstmCalculateDy(layer_t *layer, int t, int j, int T) {
+  int i;
+  int layerSize = layer->layerSize;
+  lstm_t *lstm = layer->lstmLayer;
+  
+  if(t != T) {
+    matrixTransposedVectorMul(lstm->Rz, lstm->dz[t+1][j], layerSize, layerSize, lstm->dyz[t][j]);
+    matrixTransposedVectorMul(lstm->Ri, lstm->di[t+1][j], layerSize, layerSize, lstm->dyi[t][j]);
+    matrixTransposedVectorMul(lstm->Rf, lstm->df[t+1][j], layerSize, layerSize, lstm->dyf[t][j]);
+    matrixTransposedVectorMul(lstm->Ro, lstm->d_o[t+1][j], layerSize, layerSize, lstm->dyo[t][j]);
+    //dy(t) = d(t) + Rz^T * dz(t+1) + Ri^T * di(t+1) + Rf^T * df(t+1) + Ro^T * do(t+1)
+    vectorAdd5(layer->d[t][j], lstm->dyz[t][j], lstm->dyi[t][j], lstm->dyf[t][j], lstm->dyo[t][j], layerSize, layer->dy[t][j]);
+  }
+  else {
+    //dy(t) = d(t)
+    for(i = 0; i < layerSize; i++) {
+      layer->dy[t][j][i] = layer->d[t][j][i];
+    }
+  }
+  
+  //parallel
+  lstmCalculateDo(layer, t, j);
+  lstmCalculateDc(layer, t, j, T);
+  //sync
+}
+
+cilk void mtlstmCalculateDx(layer_t *layer, int t, int j) {
+  lstm_t *lstm = layer->lstmLayer;
+  int layerSize = layer->layerSize;
+  int inputSize = layer->inputSize;
+  
+  //dztemp = Wz^T * dz(t)
+  matrixTransposedVectorMul(lstm->Wz, lstm->dz[t][j], inputSize, layerSize, lstm->dztemp[t][j]);
+  //ditemp = Wi^T * di(t)
+  matrixTransposedVectorMul(lstm->Wi, lstm->di[t][j], inputSize, layerSize, lstm->ditemp[t][j]);
+  //dftemp = Wf^T * df(t)
+  matrixTransposedVectorMul(lstm->Wf, lstm->df[t][j], inputSize, layerSize, lstm->dftemp[t][j]);
+  //dotemp = Wo^T * do(t)
+  matrixTransposedVectorMul(lstm->Wo, lstm->d_o[t][j], inputSize, layerSize, lstm->dotemp[t][j]);
+  //dx(t) = dztemp + ditemp + dftemp + dotemp
+  vectorAdd4(lstm->dztemp[t][j], lstm->ditemp[t][j], lstm->dftemp[t][j], lstm->dotemp[t][j], inputSize, layer->dx[t][j]);  
+}
+
+void lstmCalculateWeightDeltas(graph_t *graph, int j) {
+  int i, offset;
+    
+  offset = graph->numInputLayers;
+  
+  for(i = 0; i < graph->numLstmLayers; i++) {
+    lstmCalculateWeightDelta(graph, &(graph->layers[offset + i]), j);
+  }
+}
+
+void lstmCalculateWeightDelta(graph_t *graph, layer_t *layer, int j) {
+  lstm_t *lstm = layer->lstmLayer;
+  int layerSize = layer->layerSize;
+  int inputSize = layer->inputSize; 
+  int T = graph->currentSequence[j]->length-1;
+  int cur = layer->cur;
+  
+  //parallel
+  lstmCalculateDw(lstm->dz, layer->x, layerSize, inputSize, T, j, lstm->dWz[cur][j]); 
+  lstmCalculateDw(lstm->di, layer->x, layerSize, inputSize, T, j, lstm->dWi[cur][j]);
+  lstmCalculateDw(lstm->df, layer->x, layerSize, inputSize, T, j, lstm->dWf[cur][j]);
+  lstmCalculateDw(lstm->d_o, layer->x, layerSize, inputSize, T, j, lstm->dWo[cur][j]);
+  
+  lstmCalculateDr(lstm->dz, layer->y, layerSize, T, j, lstm->dRz[cur][j]);
+  lstmCalculateDr(lstm->di, layer->y, layerSize, T, j, lstm->dRi[cur][j]);
+  lstmCalculateDr(lstm->df, layer->y, layerSize, T, j, lstm->dRf[cur][j]);
+  lstmCalculateDr(lstm->d_o, layer->y, layerSize, T, j, lstm->dRo[cur][j]);
+ 
+  lstmCalculateDb(lstm->dz, layerSize, T, j, lstm->dbz[cur][j]);
+  lstmCalculateDb(lstm->di, layerSize, T, j, lstm->dbi[cur][j]);
+  lstmCalculateDb(lstm->df, layerSize, T, j, lstm->dbf[cur][j]);
+  lstmCalculateDb(lstm->d_o, layerSize, T, j, lstm->dbo[cur][j]);
+}
+
+cilk void mtlstmCalculateWeightDeltas(graph_t *graph, int j) {
+  int i, offset;
+    
+  offset = graph->numInputLayers;
+  
+  for(i = 0; i < graph->numLstmLayers; i++) {
+    spawn mtlstmCalculateWeightDelta(graph, &(graph->layers[offset + i]), j);
+  }
+}
+
+cilk void mtlstmCalculateWeightDelta(graph_t *graph, layer_t *layer, int j) {
+  lstm_t *lstm = layer->lstmLayer;
+  int layerSize = layer->layerSize;
+  int inputSize = layer->inputSize; 
+  int T = graph->currentSequence[j]->length-1;
+  int cur = layer->cur;
+  
+  spawn mtlstmCalculateDw(lstm->dz, layer->x, layerSize, inputSize, T, j, lstm->dWz[cur][j]); 
+  spawn mtlstmCalculateDw(lstm->di, layer->x, layerSize, inputSize, T, j, lstm->dWi[cur][j]);
+  spawn mtlstmCalculateDw(lstm->df, layer->x, layerSize, inputSize, T, j, lstm->dWf[cur][j]);
+  spawn mtlstmCalculateDw(lstm->d_o, layer->x, layerSize, inputSize, T, j, lstm->dWo[cur][j]);
+  
+  spawn mtlstmCalculateDr(lstm->dz, layer->y, layerSize, T, j, lstm->dRz[cur][j]);
+  spawn mtlstmCalculateDr(lstm->di, layer->y, layerSize, T, j, lstm->dRi[cur][j]);
+  spawn mtlstmCalculateDr(lstm->df, layer->y, layerSize, T, j, lstm->dRf[cur][j]);
+  spawn mtlstmCalculateDr(lstm->d_o, layer->y, layerSize, T, j, lstm->dRo[cur][j]);
+ 
+  spawn mtlstmCalculateDb(lstm->dz, layerSize, T, j, lstm->dbz[cur][j]);
+  spawn mtlstmCalculateDb(lstm->di, layerSize, T, j, lstm->dbi[cur][j]);
+  spawn mtlstmCalculateDb(lstm->df, layerSize, T, j, lstm->dbf[cur][j]);
+  spawn mtlstmCalculateDb(lstm->d_o, layerSize, T, j, lstm->dbo[cur][j]);
+}
+
+void outputCalculateY(layer_t *layer, int t, int j) {
+  output_t *output = layer->outputLayer;
+  int layerSize = layer->layerSize;
+  int inputSize = layer->inputSize; 
+  int outputLayerType = output->type;
+  int i, k; 
+    
+  //z(t) = W*x(t) + b
+  for(i = 0; i < layerSize; i++) {
+    output->z[t][j][i] = output->b[i];
+    for(k = 0; k < inputSize; k++) {
+      output->z[t][j][i] += output->W[i*inputSize+k] * layer->x[t][j][k];
+    }
+  }
+  
+  //y(t) = f(z(t))
+  switch(outputLayerType) {
+    case MSE:
+      layer->y[t][j] = output->z[t][j];
+      break;
+    case SOFTMAX:
+      //y(t) = softmax(z(t))
+      softmax(output->z[t][j], layerSize, layer->y[t][j]);
+      break;
+  }
+}
+
+void outputCalculateDx(layer_t *layer, int t, int j) {
+  output_t *output = layer->outputLayer;
+  int layerSize = layer->layerSize;
+  int inputSize = layer->inputSize; 
+  int outputLayerType = output->type;
+  int i, k, cur;
+  
+  cur = layer->cur;
+  
+  for(i = 0; i < layerSize; i++) {
+    //d[i] = y[i] - target[i]
+    layer->d[t][j][i] = layer->y[t][j][i] - output->target[t][j][i];
+    //db[i] = d[i]
+    output->db[cur][t][j][i] = layer->d[t][j][i]; 
+  }
+  
+  //dW[i][k] = x[k]*d[i]
+  for(i = 0; i < layerSize; i++) {
+    for(k = 0; k < inputSize; k++) {      
+      output->dW[cur][t][j][i*inputSize+k] = layer->x[t][j][k] * layer->d[t][j][i];
+    }
+  }  
+  
+  switch(outputLayerType) {
+    case MSE:
+      //TODO: is this correct???      
+      //dx = W^T * d
+      matrixTransposedVectorMul(output->W, layer->d[t][j], inputSize, layerSize,  layer->dx[t][j]);
+      break;
+    case SOFTMAX:
+      //dx = W^T * d
+      matrixTransposedVectorMul(output->W, layer->d[t][j], inputSize, layerSize,  layer->dx[t][j]);
+      break;
+    default:
+      printError("invalid outputLayerType", stderr, true);
+  }
+}
+
+cilk void mtoutputCalculateY(layer_t *layer, int t, int j) {
+  output_t *output = layer->outputLayer;
+  int layerSize = layer->layerSize;
+  int inputSize = layer->inputSize; 
+  int outputLayerType = output->type;
+  int i, k; 
+    
+  //z(t) = W*x(t) + b
+  for(i = 0; i < layerSize; i++) {
+    output->z[t][j][i] = output->b[i];
+    for(k = 0; k < inputSize; k++) {
+      output->z[t][j][i] += output->W[i*inputSize+k] * layer->x[t][j][k];
+    }
+  }
+  
+  //y(t) = f(z(t))
+  switch(outputLayerType) {
+    case MSE:
+      layer->y[t][j] = output->z[t][j];
+      break;
+    case SOFTMAX:
+      //y(t) = softmax(z(t))
+      softmax(output->z[t][j], layerSize, layer->y[t][j]);
+      break;
+  }
+}
+
+cilk void mtoutputCalculateDx(layer_t *layer, int t, int j) {
+  output_t *output = layer->outputLayer;
+  int layerSize = layer->layerSize;
+  int inputSize = layer->inputSize; 
+  int outputLayerType = output->type;
+  int i, k, cur;
+  
+  cur = layer->cur;
+  
+  for(i = 0; i < layerSize; i++) {
+    //d[i] = y[i] - target[i]
+    layer->d[t][j][i] = layer->y[t][j][i] - output->target[t][j][i];
+    //db[i] = d[i]
+    output->db[cur][t][j][i] = layer->d[t][j][i]; 
+  }
+  
+  //dW[i][k] = x[k]*d[i]
+  for(i = 0; i < layerSize; i++) {
+    for(k = 0; k < inputSize; k++) {      
+      output->dW[cur][t][j][i*inputSize+k] = layer->x[t][j][k] * layer->d[t][j][i];
+    }
+  }  
+  
+  switch(outputLayerType) {
+    case MSE:
+      //TODO: is this correct???
+      matrixTransposedVectorMul(output->W, layer->d[t][j], inputSize, layerSize,  layer->dx[t][j]);
+      break;
+    case SOFTMAX:
+      //dx = W^T * d
+      matrixTransposedVectorMul(output->W, layer->d[t][j], inputSize, layerSize,  layer->dx[t][j]);
+      break;
+    default:
+      printError("invalid outputLayerType", stderr, true);
+  }
+}
+
+void lstmCalculateDw(FLOAT ***d, FLOAT ***x, int layerSize, int inputSize, int T, int j, FLOAT *dW) {
+  int i, k, t;
+  
+  for(i = 0; i < layerSize; i++) {
+    for(k = 0; k < inputSize; k++) {
+      dW[i*inputSize + k] = 0;
+      for(t = 0; t <= T; t++) {
+        dW[i*inputSize + k] += d[t][j][i] * x[t][j][k];
+      }
+    }
+  }
+}
+
+void lstmCalculateDr(FLOAT ***d, FLOAT ***y, int layerSize, int T, int j, FLOAT *dR) {
+  int i, k, t;
+  
+  for(i = 0; i < layerSize; i++) {
+    for(k = 0; k < layerSize; k++) {
+      dR[i*layerSize + k] = 0;
+      for(t = 0; t <= T-1; t++) {
+        dR[i*layerSize + k] += d[t+1][j][i] * y[t][j][k];
+      }
+    }
+  }
+}
+
+void lstmCalculateDb(FLOAT ***d, int layerSize, int T, int j, FLOAT *db) {
+  int i, t;
+  
+  for(i = 0; i < layerSize; i++) {
+    db[i] = 0;
+    for(t = 0; t <= T; t++) {
+      db[i] += d[t][j][i];
+    }
+  }  
+}
+
+cilk void mtlstmCalculateDw(FLOAT ***d, FLOAT ***x, int layerSize, int inputSize, int T, int j, FLOAT *dW) {
+  spawn mtlstmCalculateDwMapI(d, x, inputSize, T, 0, layerSize, j, dW);
+}
+
+cilk void mtlstmCalculateDwMapI(FLOAT ***d, FLOAT ***x, int inputSize, int T, int i0, int i1, int j, FLOAT *dW) {
+  if (i1 - i0 == 1) {
+    spawn mtlstmCalculateDwMapK(d, x, inputSize, T, i0, 0, inputSize, j, dW);
+  } else {
+    int im = (i0 + i1) / 2;
+    spawn mtlstmCalculateDwMapI(d, x, inputSize, T, i0, im, j, dW);
+    spawn mtlstmCalculateDwMapI(d, x, inputSize, T, im, i1, j, dW);    
+  }
+}
+
+cilk void mtlstmCalculateDwMapK(FLOAT ***d, FLOAT ***x, int inputSize, int T, int i, int k0, int k1, int j, FLOAT *dW) {
+  FLOAT r;
+  
+  if (k1 - k0 == 1) {
+    r = spawn mtlstmCalculateDwMapT(d, x, 0, T+1, i, k0, j, dW);
+    dW[i*inputSize + k0] = r;
+  } else {
+    int km = (k0 + k1) / 2;
+    spawn mtlstmCalculateDwMapK(d, x, inputSize, T, i, k0, km, j, dW);   
+    spawn mtlstmCalculateDwMapK(d, x, inputSize, T, i, km, k1, j, dW);   
+  }
+}
+
+cilk FLOAT mtlstmCalculateDwMapT(FLOAT ***d, FLOAT ***x, int t0, int t1, int i, int k, int j, FLOAT *dW) {
+  FLOAT r1, r2;
+  
+  if (t1 - t0 == 1) {
+    return d[t0][j][i] * x[t0][j][k];
+  } else {
+    int tm = (t0 + t1) / 2;
+    r1 = spawn mtlstmCalculateDwMapT(d, x, t0, tm, i, k, j, dW);
+    r2 = spawn mtlstmCalculateDwMapT(d, x, tm, t1, i, k, j, dW);
+    sync;
+    return r1 + r2;
+  }
+}
+
+cilk void mtlstmCalculateDr(FLOAT ***d, FLOAT ***y, int layerSize, int T, int j, FLOAT *dR) {
+  int i, k, t;
+  
+  for(i = 0; i < layerSize; i++) {
+    for(k = 0; k < layerSize; k++) {
+      dR[i*layerSize + k] = 0;
+      for(t = 0; t <= T-1; t++) {
+        dR[i*layerSize + k] += d[t+1][j][i] * y[t][j][k];
+      }
+    }
+  }
+}
+
+cilk void mtlstmCalculateDb(FLOAT ***d, int layerSize, int T, int j, FLOAT *db) {
+  int i, t;
+  
+  for(i = 0; i < layerSize; i++) {
+    db[i] = 0;
+    for(t = 0; t <= T; t++) {
+      db[i] += d[t][j][i];
+    }
+  }  
+}
+
+void setOutputPer(graph_t *graph, int outputPer) {
+  graph->outputPer = outputPer;
+}
+
+void setOutputLayerType(graph_t *graph, int outputLayerType) {
+  output_t *output = graph->layers[graph->numLayers-1].outputLayer;
+  
+  output->type = outputLayerType;
+      
+  switch(outputLayerType) {
+    case SOFTMAX:
+      output->lossFunction = crossEntropy;
+      break;
+    case MSE:
+      output->lossFunction = mse;
+      break;
+    default:
+      printError("invalid outputLayerType", stderr, true);
+  }
+}
+
+
+void setMaxEpochs(graph_t *graph, int maxEpochs) {
+  graph->maxEpochs = maxEpochs;
+}
+
+void setMaxEpochsWithoutImprovement(graph_t *graph, int maxEpochsWithoutImprovement) {
+  graph->maxEpochsWithoutImprovement = maxEpochsWithoutImprovement;
+}
+void setShuffleSequences(graph_t *graph, int shuffleSequences) {
+  graph->shuffleSequences = shuffleSequences;
+}
+
+void setValidateEveryXEpochs(graph_t *graph, int validateEveryXEpochs) {
+  graph->validateEveryXEpochs = validateEveryXEpochs;
+}
+
+void setSaveGraphEveryXEpochs(graph_t *graph, int saveGraphEveryXEpochs) {
+  graph->saveGraphEveryXEpochs = saveGraphEveryXEpochs;
+}
+
+void setLearningRate(graph_t *graph, int layerId, FLOAT learningRate) {
+  if(0 <= layerId && layerId < graph->numLayers && 
+     (graph->layers[layerId].type == LSTM_LAYER || 
+      graph->layers[layerId].type == OUTPUT_LAYER)) {
+    graph->layers[layerId].learningRate = learningRate;
+  } else {
+    printError("layerId has to be 0 <= layerId < numLayers and pointing to a lstm layer or output layer", stderr, false);
+  } 
+}
+
+void setMomentum(graph_t *graph, int layerId, FLOAT momentum) {
+  if(0 <= layerId && layerId < graph->numLayers && 
+     (graph->layers[layerId].type == LSTM_LAYER || 
+      graph->layers[layerId].type == OUTPUT_LAYER)) {
+    graph->layers[layerId].momentum = momentum;
+  } else {
+    printError("layerId has to be 0 <= layerId < numLayers and pointing to a lstm layer or output layer", stderr, false);
+  } 
+}
+
+void setRegularization(graph_t *graph, int layerId, FLOAT regularization) {
+  if(0 <= layerId && layerId < graph->numLayers && 
+     (graph->layers[layerId].type == LSTM_LAYER || 
+      graph->layers[layerId].type == OUTPUT_LAYER)) {
+    graph->layers[layerId].regularization = regularization;
+  } else {
+    printError("layerId has to be 0 <= layerId < numLayers and pointing to a lstm layer or output layer", stderr, false);
+  } 
+}
+
+void setLayerDirection(graph_t *graph, int layerId, int layerDirection) {
+  if(0 <= layerId && layerId < graph->numLayers) {
+    graph->layers[layerId].direction = layerDirection;
+  } else {
+    printError("layerId has to be 0 <= layerId < numLayers", stderr, false);
+  } 
+}
+
+void setG(graph_t *graph, int layerId, int function){
+  lstm_t *lstm;
+  
+  if(0 <= layerId && layerId < graph->numLayers && graph->layers[layerId].type == LSTM_LAYER) {  
+    lstm = graph->layers[layerId].lstmLayer;
+    switch(function) {
+      case SIGMOID:
+        lstm->gId = SIGMOID;
+        lstm->g = sigmoid;
+        lstm->dG = dSigmoid;
+        break;
+      case TANH:
+        lstm->gId = TANH;
+        lstm->g = tanh;
+        lstm->dG = dTanh;
+        break;
+    }
+  } else {
+    printError("layerId has to be 0 <= layerId < numLayers and pointing to a lstm layer", stderr, false);
+  }    
+}
+
+void setH(graph_t *graph, int layerId, int function) {
+  lstm_t *lstm;
+    
+  if(0 <= layerId && layerId < graph->numLayers && graph->layers[layerId].type == LSTM_LAYER) {  
+    lstm = graph->layers[layerId].lstmLayer;
+    switch(function) {
+      case SIGMOID:
+        lstm->hId = SIGMOID;
+        lstm->h = sigmoid;
+        lstm->dH = dSigmoid;
+        break;
+      case TANH:
+        lstm->hId = TANH;
+        lstm->h = tanh;
+        lstm->dH = dTanh;
+        break;
+    } 
+  } else {
+    printError("layerId has to be 0 <= layerId < numLayers and pointing to a lstm layer", stderr, false);
+  }
+}
+
+void blasDgemv(char trans, FLOAT *a, FLOAT *x, FLOAT *y, int m, int n) {
+  dgemv(trans, m, n, 1, a, m, x, 1, 0, y, 1);
+}

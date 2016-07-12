@@ -1,0 +1,295 @@
+#ifndef LSTM_H
+#define LSTM_H
+
+#include "data.h"
+
+//M ... #inputs/inputSize
+//N ... #blocks/layerSize
+//T ... #timesteps
+//B ... minibatchSize
+
+typedef struct {
+} input_t;
+
+typedef struct {
+  int isTargetOfInputLayer;  
+  
+  int arraySize;
+  
+  int gId;
+  FLOAT (*g)(FLOAT);
+  FLOAT (*dG)(FLOAT);
+  int hId;
+  FLOAT (*h)(FLOAT);
+  FLOAT (*dH)(FLOAT);
+  
+  FLOAT ***dyz, ***dyi, ***dyf, ***dyo; //T.B.N
+  
+  FLOAT ***z, ***i, ***f, ***c, ***o, ***zbar, ***ibar, ***fbar, ***obar; //T.B.N
+  //FLOAT ***d; //T.B.N
+  FLOAT ***d_o, ***dc, ***di, ***df, ***dz; //T.B.N
+ 
+  FLOAT ***h_of_c; //T.B.N
+ 
+  FLOAT *Wz, *Wi, *Wf, *Wo; //N.M
+  FLOAT *Rz, *Ri, *Rf, *Ro; //N.N  
+  FLOAT *bz, *bi, *bf, *bo; //N
+  
+  FLOAT ***dWz, ***dWi, ***dWf, ***dWo; //2.B.N.M
+  FLOAT ***dRz, ***dRi, ***dRf, ***dRo; //2.B.N.N  
+  FLOAT ***dbz, ***dbi, ***dbf, ***dbo; //2.B.N 
+  
+  //TODO delete?!
+  FLOAT ***ztemp1, ***ztemp2; //T.B.N
+  FLOAT ***itemp1, ***itemp2; //T.B.N
+  FLOAT ***ftemp1, ***ftemp2; //T.B.N
+  FLOAT ***otemp1, ***otemp2; //T.B.N
+  
+  FLOAT ***dztemp; //T.B.N
+  FLOAT ***ditemp; //T.B.N
+  FLOAT ***dftemp; //T.B.N
+  FLOAT ***dotemp; //T.B.N
+} lstm_t;
+
+typedef struct {  
+  int type; //SOFTMAX or MSE
+
+  FLOAT ***z; //T.B.M
+  
+  FLOAT *W; //N.M
+  FLOAT *b; //N
+  FLOAT ****dW; //2.T.B.N.M
+  FLOAT ****db; //2.T.B.N
+  
+  FLOAT ***target; //T.B.M
+  
+  FLOAT (*lossFunction)(FLOAT *target, FLOAT *y, int n);
+} output_t;
+
+typedef struct layer_t layer_t;
+
+struct layer_t {
+  int type;
+  int direction;
+  int inputSize;
+  int layerSize;
+  int regularization; 
+  
+  int cur; //current and previous index for dW, dR, db (either 0 or 1)
+  int prev; //needed to implement weight updates with momentum
+  
+  FLOAT learningRate;
+  FLOAT momentum; 
+  
+  FLOAT ***x; //T.B.M
+  FLOAT ***dx; //T.B.M  
+  FLOAT ***y; //T.B.N
+  FLOAT ***dy; //T.B.N
+  
+  FLOAT ***d; //T.B.N error received from next layer
+  
+  int nrTargetLayers;
+  int *targetArrayOffsets; //offset inside the input array of target layer
+  int *targetArraySizes; //size of the input array of the target layer
+  layer_t **targetLayers; //array of pointers to target layers
+  
+  lstm_t *lstmLayer;
+  input_t *inputLayer;
+  output_t *outputLayer;
+};
+
+typedef struct {  
+  int bidirectional;
+
+  int numLayers;
+  int numInputLayers;
+  int numLstmLayers; 
+  int outputLayerOffset;  
+    
+  int minibatchSize; 
+  int maxEpochs;
+  int maxEpochsWithoutImprovement;
+  int shuffleSequences;
+  int validateEveryXEpochs; 
+  int saveGraphEveryXEpochs;
+  int outputPer; 
+  
+  int *layerInitOffsets;  
+  int *adjMatrix;
+  
+  sequence_t **currentSequence;
+  
+  struct layer_t *layers;
+} graph_t;
+
+typedef struct {
+  int type;
+  int correct; 
+  int incorrect; 
+  FLOAT error;
+} error_t;
+
+void initLayerTargets(graph_t *graph, int i);
+void initInputLayer(graph_t *graph, int *layerSizes, int i);
+void initLstmLayer(graph_t *graph, int *layerSizes, int i);
+void initOutputLayer(graph_t *graph, int *layerSizes, int i);
+int calcInputSize(int numLayers, int *adjMatrix, int *layerSizes, int idx);
+graph_t *createGraph(int *adjMatrix, int numLayers, int *layerSizes, int minibatchSize, int bidirectional);
+graph_t *createLstm(int *layerSizes, int minibatchSize);
+graph_t *createBlstm(int *layerSizes, int minibatchSize);
+
+FLOAT *allocate1dArray(int a);
+FLOAT **allocate2dArray(int a, int b);
+FLOAT ***allocate3dArray(int a, int b, int c);
+FLOAT ****allocate4dArray(int a, int b, int c, int d);
+
+char *typeNumToTypeName(int typeNum);
+
+void printGraph(graph_t *graph, FILE *out);
+
+void initializeMatrix(FLOAT *a, int m, int n);
+void initializeVector(FLOAT *v, int n);
+
+void train(graph_t *graph, data_t *trainData, data_t *testData);
+void trainSequence(graph_t *graph, sequence_t *sequence, int j);
+cilk void mttrain(graph_t *graph, data_t *trainData, data_t *testData);
+cilk void mttrainSequence(graph_t *graph, sequence_t *sequence, int j);
+
+void forwardPass(graph_t *graph, sequence_t *sequence, int j);
+void forwardPassInputLayers(graph_t *graph, int t, int j);
+void forwardPassInputLayer(layer_t *layer, int t, int j);
+void forwardPassLstmLayers(graph_t *graph, int t, int j);
+void forwardPassLstmLayer(graph_t *graph, layer_t *layer, int t, int j);
+void forwardPassOutputLayer(graph_t *graph, int t, int j);
+void forwardOutputToNextLayers(graph_t *graph, layer_t *layer, int t, int j);
+void forwardOutputToNextLayer(graph_t *graph, layer_t *layer, layer_t *targetLayer, int offset, int t, int j);
+cilk void mtforwardPass(graph_t *graph, sequence_t *sequence, int j);
+cilk void mtforwardPassInputLayers(graph_t *graph, int t, int j);
+cilk void mtforwardPassInputLayer(layer_t *layer, int t, int j);
+cilk void mtforwardPassLstmLayers(graph_t *graph, int t, int j);
+cilk void mtforwardPassLstmLayer(graph_t *graph, layer_t *layer, int t, int j);
+cilk void mtforwardPassOutputLayer(graph_t *graph, int t, int j);
+cilk void mtforwardOutputToNextLayers(graph_t *graph, layer_t *layer, int t, int j);
+/**/cilk void mtforwardOutputToNextLayer(graph_t *graph, layer_t *layer, layer_t *targetLayer, int offset, int t, int j);
+
+void backwardPass(graph_t *graph, int j);
+void backwardPassLstmLayers(graph_t *graph, int t, int j, int T);
+void backwardPassLstmLayer(graph_t *graph, layer_t *layer, int t, int j, int T);
+void backwardPassOutputLayer(graph_t *graph, int t, int j);
+cilk void mtbackwardPass(graph_t *graph, int j);
+cilk void mtbackwardPassLstmLayers(graph_t *graph, int t, int j, int T);
+/**/cilk void mtbackwardPassLstmLayer(graph_t *graph, layer_t *layer, int t, int j, int T);
+cilk void mtbackwardPassOutputLayer(graph_t *graph, int t, int j);
+
+void updateWeights(graph_t *graph);
+void updateWeightsLayer(graph_t *graph, layer_t *layer);
+void updateWeightsLstmLayer(graph_t *graph, layer_t *layer);
+void updateWeightsOutputLayer(graph_t *graph, layer_t *layer);
+cilk void mtupdateWeights(graph_t *graph);
+cilk void mtupdateWeightsLayer(graph_t *graph, layer_t *layer);
+cilk void mtupdateWeightsLstmLayer(graph_t *graph, layer_t *layer);
+cilk void mtupdateWeightsOutputLayer(graph_t *graph, layer_t *layer);
+
+error_t calculateError(graph_t *graph, data_t *data);
+error_t calculateErrorSequence(graph_t *graph, sequence_t *sequence, int numOutputs);
+error_t calculateErrorSoftmax(FLOAT *y, FLOAT *target, int n);
+error_t calculateErrorMse(FLOAT *y, FLOAT *target, int n);
+cilk error_t mtcalculateError(graph_t *graph, data_t *data, int i0, int i1);
+/**/cilk error_t mtcalculateErrorSequence(graph_t *graph, sequence_t *sequence, int numOutputs);
+/**/cilk error_t mtcalculateErrorSoftmax(FLOAT *y, FLOAT *target, int n);
+/**/cilk error_t mtcalculateErrorMse(FLOAT *y, FLOAT *target, int n);
+void addError(error_t *e1, error_t e2);
+
+void shuffleVector(int *v, int n);
+/**/cilk void mtshuffleVector(int *v, int n);
+
+void setInputSequence(layer_t *layer, FLOAT **x, int sequenceLength, int j, int direction);
+void setInputTimestep(layer_t *layer, FLOAT *x, int t, int j);
+void setOutputSequence(layer_t *layer, FLOAT **target, int sequenceLength, int j, int direction);
+void setOutputTimestep(layer_t *layer, FLOAT *target, int t, int j);
+cilk void mtsetInputSequence(layer_t *layer, FLOAT **x, int sequenceLength, int t0, int t1, int j, int direction);
+cilk void mtsetOutputSequence(layer_t *layer, FLOAT **target, int sequenceLength, int t0, int t1, int j, int direction);
+
+void matrixVectorMul(FLOAT *a, FLOAT *v, int m, int n, FLOAT *result);
+void matrixTransposedVectorMul(FLOAT *a, FLOAT *v, int m, int n, FLOAT *result);
+void applyFunction(FLOAT (*f)(FLOAT), FLOAT *v, int n, FLOAT *result);
+void vectorAdd3(FLOAT *v1, FLOAT *v2, FLOAT *v3, int n, FLOAT *result);
+void vectorAdd4(FLOAT *v1, FLOAT *v2, FLOAT *v3, FLOAT *v4, int n, FLOAT *result);
+void vectorAdd5(FLOAT *v1, FLOAT *v2, FLOAT *v3, FLOAT *v4, FLOAT *v5, int n, FLOAT *result);
+
+void lstmCalculateZbar(layer_t *layer, int t, int j);
+void lstmCalculateZ(layer_t *layer, int t, int j);
+void lstmCalculateIbar(layer_t *layer, int t, int j);
+void lstmCalculateI(layer_t *layer, int t, int j);
+void lstmCalculateFbar(layer_t *layer, int t, int j);
+void lstmCalculateF(layer_t *layer, int t, int j);
+void lstmCalculateC(layer_t *layer, int t, int j);
+void lstmCalculateObar(layer_t *layer, int t, int j);
+void lstmCalculateO(layer_t *layer, int t, int j);
+void lstmCalculateY(layer_t *layer, int t, int j);
+cilk void mtlstmCalculateZbar(layer_t *layer, int t, int j);
+cilk void mtlstmCalculateZ(layer_t *layer, int t, int j);
+cilk void mtlstmCalculateIbar(layer_t *layer, int t, int j);
+cilk void mtlstmCalculateI(layer_t *layer, int t, int j);
+cilk void mtlstmCalculateFbar(layer_t *layer, int t, int j);
+cilk void mtlstmCalculateF(layer_t *layer, int t, int j);
+cilk void mtlstmCalculateC(layer_t *layer, int t, int j);
+cilk void mtlstmCalculateObar(layer_t *layer, int t, int j);
+cilk void mtlstmCalculateO(layer_t *layer, int t, int j);
+cilk void mtlstmCalculateY(layer_t *layer, int t, int j);
+
+void lstmCalculateDz(layer_t *layer, int t, int j);
+void lstmCalculateDi(layer_t *layer, int t, int j);
+void lstmCalculateDf(layer_t *layer, int t, int j);
+void lstmCalculateDc(layer_t *layer, int t, int j, int T);
+void lstmCalculateDo(layer_t *layer, int t, int j);
+void lstmCalculateDy(layer_t *layer, int t, int j, int T);
+void lstmCalculateDx(layer_t *layer, int t, int j);
+cilk void mtlstmCalculateDz(layer_t *layer, int t, int j);
+cilk void mtlstmCalculateDi(layer_t *layer, int t, int j);
+cilk void mtlstmCalculateDf(layer_t *layer, int t, int j);
+cilk void mtlstmCalculateDc(layer_t *layer, int t, int j, int T);
+cilk void mtlstmCalculateDo(layer_t *layer, int t, int j);
+cilk void mtlstmCalculateDy(layer_t *layer, int t, int j, int T);
+cilk void mtlstmCalculateDx(layer_t *layer, int t, int j);
+
+void lstmCalculateWeightDeltas(graph_t *graph, int j);
+void lstmCalculateWeightDelta(graph_t *graph, layer_t *layer, int j);
+cilk void mtlstmCalculateWeightDeltas(graph_t *graph, int j);
+cilk void mtlstmCalculateWeightDelta(graph_t *graph, layer_t *layer, int j);
+
+void outputCalculateY(layer_t *layer, int t, int j);
+void outputCalculateDx(layer_t *layer, int t, int j);
+cilk void mtoutputCalculateY(layer_t *layer, int t, int j);
+cilk void mtoutputCalculateDx(layer_t *layer, int t, int j);
+
+void lstmCalculateDw(FLOAT ***d, FLOAT ***x, int layerSize, int inputSize, int T, int j, FLOAT *dW);
+void lstmCalculateDr(FLOAT ***d, FLOAT ***y, int layerSize, int T, int j, FLOAT *dR);
+void lstmCalculateDb(FLOAT ***d, int layerSize, int T, int j, FLOAT *db);
+/*?*/cilk void mtlstmCalculateDw(FLOAT ***d, FLOAT ***x, int layerSize, int inputSize, int T, int j, FLOAT *dW);
+/*?*/cilk void mtlstmCalculateDwMapI(FLOAT ***d, FLOAT ***x, int inputSize, int T, int i0, int i1, int j, FLOAT *dW);
+/*?*/cilk void mtlstmCalculateDwMapK(FLOAT ***d, FLOAT ***x, int inputSize, int T, int i, int k0, int k1, int j, FLOAT *dW);
+/*?*/cilk FLOAT mtlstmCalculateDwMapT(FLOAT ***d, FLOAT ***x, int t0, int t1, int i, int k, int j, FLOAT *dW);
+/*>>*/cilk void mtlstmCalculateDr(FLOAT ***d, FLOAT ***y, int layerSize, int T, int j, FLOAT *dR);
+cilk void mtlstmCalculateDrMapI(FLOAT ***d, FLOAT ***x, int inputSize, int T, int i0, int i1, int j, FLOAT *dW);
+cilk void mtlstmCalculateDrMapK(FLOAT ***d, FLOAT ***x, int inputSize, int T, int i, int k0, int k1, int j, FLOAT *dW);
+cilk FLOAT mtlstmCalculateDrMapT(FLOAT ***d, FLOAT ***x, int t0, int t1, int i, int k, int j, FLOAT *dW);
+cilk void mtlstmCalculateDb(FLOAT ***d, int layerSize, int T, int j, FLOAT *db);
+
+void setOutputPer(graph_t *graph, int outputPer);
+void setOutputLayerType(graph_t *graph, int outputLayerType);
+void setMaxEpochs(graph_t *graph, int maxEpochs);
+void setMaxEpochsWithoutImprovement(graph_t *graph, int maxEpochsWithoutImprovement);
+void setShuffleSequences(graph_t *graph, int shuffleSequences);
+void setValidateEveryXEpochs(graph_t *graph, int validateEveryXEpochs);
+void setSaveGraphEveryXEpochs(graph_t *graph, int saveGraphEveryXEpochs);
+void setLearningRate(graph_t *graph, int layerId, FLOAT learningRate);
+void setMomentum(graph_t *graph, int layerId, FLOAT momentum);
+void setRegularization(graph_t *graph, int layerId, FLOAT regularization);
+void setLayerDirection(graph_t *graph, int layerId, int layerDirection);
+void setG(graph_t *graph, int layerId, int function);
+void setH(graph_t *graph, int layerId, int function);
+
+void blasDgemv(char trans, FLOAT *a, FLOAT *x, FLOAT *y, int m, int n);
+
+#endif /* LSTM_H */
